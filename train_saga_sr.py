@@ -263,7 +263,7 @@ class SAGASRTrainer(pl.LightningModule):
             # 3. padding_mask（Stable Audio需要）
             if 'padding_mask' not in m:
                 # 创建全1的padding mask（表示全部是有效音频）
-                m['padding_mask'] = torch.ones(hr_audio.shape[1], dtype=torch.bool)
+                m['padding_mask'] = torch.ones(hr_audio.shape[-1], dtype=torch.bool)
         
         # 使用Stable Audio的conditioner处理metadata
         conditioning = self.model.conditioner(metadata, self.device)
@@ -344,7 +344,7 @@ class SAGASRTrainer(pl.LightningModule):
             m['seconds_start'] = 0
             m['seconds_total'] = 5.94
             if 'padding_mask' not in m:
-                m['padding_mask'] = torch.ones(hr_audio.shape[1], dtype=torch.bool)
+                m['padding_mask'] = torch.ones(hr_audio.shape[-1], dtype=torch.bool)
         
         # 使用模型生成高分辨率音频
         conditioning = self.model.conditioner(metadata, self.device)
