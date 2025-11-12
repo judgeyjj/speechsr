@@ -1,0 +1,18 @@
+SAGA-SR: SEMANTICALLY AND ACOUSTICALLY GUIDED AUDIO SUPER-RESOLUTION 是一个递交给2026 ICASSP的论文，其论文地址：https://arxiv.org/abs/2509.24924
+现在，我们需要复现这篇论文。
+经过我的调研，这篇论文是一个积木类的论文，其组成是：
+1.  由 **Stability AI** 团队开源的 `stable-audio-tools` 框架，作为模型的基础，提供了预训练的 VAE 和 DiT 架构。
+2.  由 GOOGLE 团队开源的 T5 文本编码器。我们将采用其更先进的 **Flan-T5** 版本。
+3.  **核心技术流程** (根据论文调整后):
+    a. **获取引导信息**:
+        *   **语义引导**: 输入的低分辨率音频，首先通过 `Qwen-Audio` 模型生成音频内容的文字描述（Audio Captioning）。
+        *   **声学引导**: 同时，使用 `librosa` 库计算该音频的**频谱滚降点**。
+    b. **编码为特征**:
+        *   `Qwen-Audio` 生成的文本，被送入 `Flan-T5` 的编码器，转换成**文本嵌入向量 (Text Embedding)**。
+        *   频谱滚降点这个数值，则通过傅里叶编码转换为**声学嵌入向量 (Acoustic Embedding)**。
+    c. **DiT 核心处理**:
+        *   低分辨率音频通过 VAE 的编码器，被压缩成**潜在表示 (Latent)**。
+        *   DiT 模型接收加噪后的潜在表示，并在**交叉注意力 (Cross-Attention)** 机制中，同时利用**文本嵌入**和**声学嵌入**作为条件引导，进行迭代去噪。
+    d. **生成输出**:
+        *   DiT 输出去噪后的纯净潜在表示。
+        *   最后，这个潜在表示通过 VAE 的解码器，被重建为高分辨率的音频波形。
