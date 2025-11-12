@@ -43,9 +43,8 @@ class SAGASRCFGWrapper:
         rolloff_prepend = None
         prepend_mask = self.bundle.prepend_mask
         if rolloff_global is not None:
-            timestep_embed = self.base_model.to_timestep_embed(
-                self.base_model.timestep_features(t[:, None])
-            )
+            dit = self.base_model.model if hasattr(self.base_model, "model") else self.base_model
+            timestep_embed = dit.to_timestep_embed(dit.timestep_features(t[:, None]))
             rolloff_prepend = rolloff_global.unsqueeze(1) + timestep_embed.unsqueeze(1)
             if (
                 prepend_mask is None

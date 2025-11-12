@@ -183,6 +183,13 @@ class SAGASRTrainer(pl.LightningModule):
             return None
         return math.sqrt(total)
 
+    def _get_dit(self):
+        """返回底层 DiffusionTransformer 模型。"""
+        model = self.model.model  # DiTWrapper
+        if hasattr(model, "model"):
+            return model.model
+        raise AttributeError("DiffusionTransformer not found in wrapped model.")
+
     def _build_rolloff_prepend(self, rolloff_global: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """
         根据论文要求，将 roll-off 全局嵌入与当前时间步嵌入相加，构造 prepend token。
@@ -192,9 +199,9 @@ class SAGASRTrainer(pl.LightningModule):
         Returns:
             rolloff_prepend: [B, 1, D]
         """
-        timestep_embed = self.model.model.to_timestep_embed(
-            self.model.model.timestep_features(timesteps[:, None])
-        )  # [B, D]
+        dit = self._get_dit()
+        timestep_features = dit.timestep_features(timesteps[:, None])
+        timestep_embed = dit.to_timestep_embed(timestep_features)  # [B, D]
         rolloff_prepend = rolloff_global.unsqueeze(1) + timestep_embed.unsqueeze(1)
         return rolloff_prepend
 
