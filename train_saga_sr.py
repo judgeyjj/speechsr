@@ -3,6 +3,7 @@ import json
 import math
 import random
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
@@ -87,6 +88,9 @@ class SAGASRTrainer(pl.LightningModule):
         self.config = config
 
         self._freeze_non_dit_modules()
+        dit_core = self._get_dit()
+        if not hasattr(dit_core, "to_prepend_embed"):
+            dit_core.to_prepend_embed = nn.Identity()
         
         # 创建Roll-off条件器
         # 注意：embedding_dim_cross必须匹配T5的维度（768）才能拼接

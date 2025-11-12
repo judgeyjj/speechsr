@@ -43,6 +43,9 @@ class SAGASRInference:
         # 创建Stable Audio模型
         from stable_audio_tools.models.factory import create_model_from_config
         self.model = create_model_from_config(self.config)
+        dit_core = self.model.model.model if hasattr(self.model.model, "model") else self.model.model
+        if not hasattr(dit_core, "to_prepend_embed"):
+            dit_core.to_prepend_embed = torch.nn.Identity()
         
         # 加载权重
         checkpoint = torch.load(model_checkpoint_path, map_location=device)
