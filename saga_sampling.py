@@ -17,6 +17,7 @@ class ConditioningBundle:
     rolloff_cond: Dict[str, Optional[torch.Tensor]]
     cross_attn_text: Optional[torch.Tensor]
     global_cond: Optional[torch.Tensor]
+    prepend_mask: Optional[torch.Tensor] = None
 
 
 class SAGASRCFGWrapper:
@@ -39,6 +40,24 @@ class SAGASRCFGWrapper:
         rolloff_cross = self.bundle.rolloff_cond.get("cross_attn")
         rolloff_global = self.bundle.rolloff_cond.get("global")
 
+        rolloff_prepend = None
+        prepend_mask = self.bundle.prepend_mask
+        if rolloff_global is not None:
+            timestep_embed = self.base_model.to_timestep_embed(
+                self.base_model.timestep_features(t[:, None])
+            )
+            rolloff_prepend = rolloff_global.unsqueeze(1) + timestep_embed.unsqueeze(1)
+            if (
+                prepend_mask is None
+                or prepend_mask.shape[0] != rolloff_prepend.shape[0]
+                or prepend_mask.shape[1] != rolloff_prepend.shape[1]
+            ):
+                prepend_mask = torch.ones(
+                    rolloff_prepend.shape[:2],
+                    device=rolloff_prepend.device,
+                    dtype=torch.bool,
+                )
+
         # 1. 无条件分支
         v_uncond = self.base_model(
             x,
@@ -46,6 +65,8 @@ class SAGASRCFGWrapper:
             input_concat_cond=lr_latent,
             cross_attn_cond=None,
             global_cond=None,
+            prepend_cond=None,
+            prepend_cond_mask=None,
         )
 
         # 2. 声学分支（仅 roll-off）
@@ -54,7 +75,9 @@ class SAGASRCFGWrapper:
             t,
             input_concat_cond=lr_latent,
             cross_attn_cond=rolloff_cross,
-            global_cond=rolloff_global,
+            global_cond=self.global_cond,
+            prepend_cond=rolloff_prepend,
+            prepend_cond_mask=prepend_mask,
         )
 
         # 3. 完整条件（文本 + roll-off）
@@ -70,7 +93,9 @@ class SAGASRCFGWrapper:
             t,
             input_concat_cond=lr_latent,
             cross_attn_cond=cross_attn_full,
-            global_cond=rolloff_global,
+            global_cond=self.global_cond,
+            prepend_cond=rolloff_prepend,
+            prepend_cond_mask=prepend_mask,
         )
 
         # 多重 CFG 合成
@@ -96,6 +121,7 @@ def sample_cfg_euler(
         rolloff_cond=rolloff_cond,
         cross_attn_text=conditioning_inputs.get("cross_attn_cond"),
         global_cond=conditioning_inputs.get("global_cond"),
+        prepend_mask=conditioning_inputs.get("prepend_cond_mask"),
     )
 
     cfg_wrapper = SAGASRCFGWrapper(

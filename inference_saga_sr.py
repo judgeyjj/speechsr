@@ -56,7 +56,7 @@ class SAGASRInference:
         
         # 创建Roll-off条件器
         self.rolloff_conditioner = RolloffFourierConditioner(
-            embedding_dim_cross=256,
+            embedding_dim_cross=768,
             embedding_dim_global=self.config['model']['diffusion']['config']['global_cond_dim'],
             dropout_rate=0.1
         ).to(device)
@@ -134,6 +134,7 @@ class SAGASRInference:
         
         conditioning_inputs = self._prepare_conditioning_inputs(
             lr_latent=lr_latent,
+            lr_audio=lr_audio,
             rolloff_low=rolloff_low,
             rolloff_high=rolloff_high,
             caption=caption,
@@ -152,6 +153,7 @@ class SAGASRInference:
         
         # 解码
         hr_audio = self.model.pretransform.decode(hr_latent)
+        hr_audio = self._low_frequency_replace(hr_audio, lr_audio)
         
         # 保存
         torchaudio.save(output_audio_path, hr_audio.cpu(), 44100)
@@ -162,6 +164,7 @@ class SAGASRInference:
     def _prepare_conditioning_inputs(
         self,
         lr_latent: torch.Tensor,
+        lr_audio: torch.Tensor,
         rolloff_low: torch.Tensor,
         rolloff_high: torch.Tensor,
         caption: str,
@@ -176,19 +179,70 @@ class SAGASRInference:
             apply_dropout=apply_dropout,
         )
 
-        # 文本条件
-        text_cond = None
-        if self.use_caption and caption is not None and hasattr(self.model, 'conditioner'):
-            conditioning_result = self.model.conditioner({'prompt': [caption]}, self.device)
-            text_cond = conditioning_result.get('cross_attn') if isinstance(conditioning_result, dict) else conditioning_result
+        seconds_total = lr_audio.shape[-1] / 44100.0
+        metadata = [{
+            'prompt': caption if caption is not None else "",
+            'seconds_start': 0.0,
+            'seconds_total': float(seconds_total),
+            'padding_mask': torch.ones(lr_audio.shape[-1], dtype=torch.bool),
+        }]
 
-        conditioning_inputs = {
-            'cross_attn_cond': text_cond,
-            'global_cond': rolloff_cond['global'],
-            'rolloff_cond': rolloff_cond,
-        }
+        conditioning = self.model.conditioner(metadata, self.device)
+        conditioning_inputs = self.model.get_conditioning_inputs(conditioning)
+
+        if rolloff_cond['cross_attn'] is not None:
+            if conditioning_inputs.get('cross_attn_cond') is not None:
+                conditioning_inputs['cross_attn_cond'] = torch.cat(
+                    [conditioning_inputs['cross_attn_cond'], rolloff_cond['cross_attn']],
+                    dim=1
+                )
+            else:
+                conditioning_inputs['cross_attn_cond'] = rolloff_cond['cross_attn']
+
+        conditioning_inputs['rolloff_cond'] = rolloff_cond
 
         return conditioning_inputs
+
+    def _low_frequency_replace(
+        self,
+        generated: torch.Tensor,
+        lr_audio: torch.Tensor,
+        cutoff_hz: float = 200.0,
+    ) -> torch.Tensor:
+        """
+        低频替换：用原始低分辨率音频的低频段替换生成音频的对应频段。
+        """
+        if generated.dim() == 3:
+            gen = generated.squeeze(1)
+        else:
+            gen = generated
+
+        if lr_audio.dim() == 3:
+            lr = lr_audio.squeeze(1)
+        elif lr_audio.dim() == 2:
+            lr = lr_audio
+        else:
+            lr = lr_audio.unsqueeze(0)
+
+        n = gen.shape[-1]
+        if lr.shape[-1] != n:
+            lr = torch.nn.functional.interpolate(
+                lr.unsqueeze(1),
+                size=n,
+                mode='linear',
+                align_corners=False,
+            ).squeeze(1)
+
+        gen_fft = torch.fft.rfft(gen)
+        lr_fft = torch.fft.rfft(lr.to(gen.device))
+        freqs = torch.fft.rfftfreq(n, d=1.0 / 44100.0).to(gen.device)
+        mask = freqs <= cutoff_hz
+        gen_fft[..., mask] = lr_fft[..., mask]
+        merged = torch.fft.irfft(gen_fft, n=n)
+
+        if generated.dim() == 3:
+            return merged.unsqueeze(1)
+        return merged
 
 
 def main():

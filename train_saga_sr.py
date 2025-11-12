@@ -16,6 +16,7 @@ except ImportError:
     swanlab = None  # SwanLab is optional
 
 from stable_audio_tools.inference.sampling import sample_discrete_euler
+from stable_audio_tools.training.utils import InverseLR
 
 from dataset import SAGASRDataset
 from conditioner_rolloff import RolloffFourierConditioner, CombinedConditioner
@@ -182,6 +183,21 @@ class SAGASRTrainer(pl.LightningModule):
             return None
         return math.sqrt(total)
 
+    def _build_rolloff_prepend(self, rolloff_global: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        """
+        根据论文要求，将 roll-off 全局嵌入与当前时间步嵌入相加，构造 prepend token。
+        Args:
+            rolloff_global: [B, D] roll-off 全局嵌入
+            timesteps: [B] 扩散时间步 (0~1)
+        Returns:
+            rolloff_prepend: [B, 1, D]
+        """
+        timestep_embed = self.model.model.to_timestep_embed(
+            self.model.model.timestep_features(timesteps[:, None])
+        )  # [B, D]
+        rolloff_prepend = rolloff_global.unsqueeze(1) + timestep_embed.unsqueeze(1)
+        return rolloff_prepend
+
     
     def training_step(self, batch, batch_idx):
         """
@@ -260,14 +276,13 @@ class SAGASRTrainer(pl.LightningModule):
                 ], dim=1)
             else:
                 conditioning_inputs['cross_attn_cond'] = rolloff_cond['cross_attn']
-        
+
         if rolloff_cond['global'] is not None:
-            # 通道2: 与原始 global_cond 相加，DiT 内部会自动与 timestep 嵌入相加 (dit.py L174)
-            # 注：由于模型配置中没有 prepend_cond_dim，我们使用 global_cond 机制
-            if conditioning_inputs.get('global_cond') is not None:
-                conditioning_inputs['global_cond'] = conditioning_inputs['global_cond'] + rolloff_cond['global']
-            else:
-                conditioning_inputs['global_cond'] = rolloff_cond['global']
+            rolloff_prepend = self._build_rolloff_prepend(rolloff_cond['global'], t)
+            conditioning_inputs['prepend_cond'] = rolloff_prepend
+            conditioning_inputs['prepend_cond_mask'] = torch.ones(
+                rolloff_prepend.shape[:2], device=self.device, dtype=torch.bool
+            )
         
         # 添加SAGA-SR的input_concat_cond（低分辨率latent）
         conditioning_inputs['input_concat_cond'] = lr_latent
@@ -338,12 +353,6 @@ class SAGASRTrainer(pl.LightningModule):
                 ], dim=1)
             else:
                 conditioning_inputs['cross_attn_cond'] = rolloff_cond['cross_attn']
-        
-        if rolloff_cond['global'] is not None:
-            if conditioning_inputs.get('global_cond') is not None:
-                conditioning_inputs['global_cond'] = conditioning_inputs['global_cond'] + rolloff_cond['global']
-            else:
-                conditioning_inputs['global_cond'] = rolloff_cond['global']
         
         conditioning_inputs['input_concat_cond'] = lr_latent
 
@@ -445,9 +454,11 @@ class SAGASRTrainer(pl.LightningModule):
             betas=(0.9, 0.999)
         )
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
+        scheduler = InverseLR(
             optimizer,
-            lr_lambda=lambda step: 0.99 * (1 + step / 1e6) ** (-0.5)
+            inv_gamma=1_000_000,
+            power=0.5,
+            warmup=0.99
         )
 
         return {

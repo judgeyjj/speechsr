@@ -112,45 +112,119 @@ training_step中实现的 Flow Matching 损失函数完全正确，包括噪声�
 4. 验证采样和input_concat_cond完全符合原文，并没有出现问题
 ### 2. 未正确实现的模块 (问题点)
 
-以下模块的实现与论文描述存在偏差，需要重点排查和修正：
+以下模块已按论文路线重新实现，状态标记为“待验证”：
 
-- **问题一：Roll-off 全局条件注入方式错误 (核心问题)** ✅ 已修复
+- **问题一：Roll-off 全局条件注入方式** ✅（待验证）
 
-  - **论文描述**: "The input and target roll-off embeddings are concatenated along the channel dimension, projected by linear layers, **summed with the timestep sinusoidal embeddings**, and then prepended to the input of DiT."
-    这意味着 Roll-off 全局条件应该与 **时间步 `t` 的嵌入** 结合，而不是与其他全局条件混合。
+  - **论文原文**：
+    ```15:20:SAGA_SR.md
+    - 注入：双通道
+      - Cross-Attention：与文本嵌入拼接
+      - Global：与时间步嵌入相加后prepend到DiT输入
+    ```
+  - **当前实现**：
+    ```185:198:train_saga_sr.py
+    def _build_rolloff_prepend(...):
+        timestep_embed = self.model.model.to_timestep_embed(
+            self.model.model.timestep_features(timesteps[:, None])
+        )
+        rolloff_prepend = rolloff_global.unsqueeze(1) + timestep_embed.unsqueeze(1)
+    ```
+    ```268:284:train_saga_sr.py
+        if rolloff_cond['global'] is not None:
+            rolloff_prepend = self._build_rolloff_prepend(rolloff_cond['global'], t)
+            conditioning_inputs['prepend_cond'] = rolloff_prepend
+            conditioning_inputs['prepend_cond_mask'] = torch.ones(...)
+    ```
+  - **说明**：训练时不再把 roll-off 向量与原始 `global_cond` 相加，而是与当步时间嵌入求和后作为 prepend token 注入，符合论文描述。
 
-  - **当前实现的代码追踪**: 
-    1. 在 `train_saga_sr.py` 的 `266-268` 行，代码将 `rolloff_cond['global']` 与 `stable-audio-tools` 原有的 `global_cond`（时长等信息）进行了**元素相加**。
-    2. 这个相加后的结果，作为 `global_embed` 参数被传入 `DiffusionTransformer` 模型。
-    3. 在 `stable-audio-tools/stable_audio_tools/models/dit.py` 的 `174` 行，`DiffusionTransformer` 内部又将传入的 `global_embed` 与 `timestep_embed` **再次相加**。
+- **问题二：Roll-off prepend 通道配置** ✅（待验证）
 
-  - **根本原因分析 (信息污染)**:
-    - **第一层污染**: 将 `rolloff_cond`（频谱信息）与 `original_global_cond`（时长信息）相加，导致两种完全不同语义的高维特征被强行混合，模型无法学习到它们各自独立的含义。
-    - **第二层污染**: 上一步产生的混合特征，又进一步污染了最关键的 `timestep_embed`（时间步信息）。这使得模型在去噪的每一步都接收到了一个被严重混淆的信号，它既无法清晰地知道“现在去噪到哪一步了？”，也无法准确理解“要去噪的目标频谱特征是怎样的？”
-    - **最终影响**: 这种双重信息污染，是导致模型无法学习到正确的去噪策略、损失函数停滞不前、梯度行为异常的根本原因。
+  - **论文原文**同上。
+  - **当前实现**：
+    ```78:86:saga_model_config.json
+        "global_cond_dim": 1536,
+        "prepend_cond_dim": 1536,
+    ```
+    ```58:100:saga_sampling.py
+        rolloff_prepend = rolloff_global.unsqueeze(1) + timestep_embed.unsqueeze(1)
+        ...
+        v_acoustic = self.base_model(..., prepend_cond=rolloff_prepend, ...)
+    ```
+  - **说明**：配置显式启用 `prepend_cond_dim`，训练/推理流程均在 `prepend_cond` 通道注入 roll-off token，彻底脱离 `global_cond` 通路。
 
-- **问题二：推理阶段丢失原始 Global 条件** ✅ 已修复
+- **问题三：CFG 分支隔离声学条件** ✅（待验证）
 
-  - **论文要求**: 推理必须与训练保持一致，除 roll-off 条件外，还需保留 Stable Audio 原有的 global 条件（如 `seconds_start`、`seconds_total`），以保证 DiT 收到完整的语义线索。
+  - **论文原文**：
+    ```38:45:SAGA_SR.md
+    v_final = v_uncond + s_a*(v_acoustic - v_uncond) + s_t*(v_text - v_uncond)
+    ```
+  - **当前实现**：
+    ```100:144:saga_sampling.py
+        v_uncond = self.base_model(..., global_cond=None, prepend_cond=None)
+        v_acoustic = self.base_model(..., global_cond=self.global_cond, prepend_cond=rolloff_prepend)
+        v_full = self.base_model(..., global_cond=self.global_cond, prepend_cond=rolloff_prepend)
+    ```
+  - **说明**：CFG 包装器仅在声学/完整分支加入 roll-off prepend token，`v_uncond` 完全不含 roll-off，声学差值重新对齐论文设定。
 
-  - **代码证据**: 在 `train_saga_sr.py` 的 `_SAGASRCFGWrapper.__call__` 方法中 (L498-L522)，调用 `self.base_model` 时，`global_cond` 参数被硬编码为 `self.rolloff_cond['global']`，而 `__init__` 方法中保存的原始 `global_cond` (`self.global_cond`) 未被使用。
+- **问题四：InverseLR 调度器** ✅（待验证）
 
-  - **影响分析**: 训练时 `global_cond` 是 `(原始 + Roll-off)`，推理时却变成了 `(只有 Roll-off)`。`v_acoustic - v_uncond` 原本应该捕捉“所有非文本条件”的贡献，但现在只能反映 roll-off 的影响，原始 global 条件完全缺失。这种训练与推理的不一致直接导致 CFG 基准错位，模型在评估时缺乏必要的时长等线索，是造成 LSD/SDR 极端异常的真正原因。
+  - **论文原文**：
+    ```45:58:SAGA_SR_analysis.md
+    - **学习率调度器**: InverseLR（inv_gamma=1e6, power=0.5, warmup=0.99）
+    ```
+  - **当前实现**：
+    ```436:447:train_saga_sr.py
+        scheduler = InverseLR(
+            optimizer,
+            inv_gamma=1_000_000,
+            power=0.5,
+            warmup=0.99
+        )
+    ```
+  - **说明**：Lightning 调度器改为直接调用 Stable Audio 内置 `InverseLR`，曲线与论文/配置文件保持一致。
 
-- **问题三：全局通道未拆分导致 Token 语义混淆** ✅ 已修复
+- **问题五：Roll-off Cross-Attention 维度统一** ✅（待验证）
 
-  - **论文要求**: Roll-off global 嵌入应作为额外的 token 前置 (prepend)，与时间步嵌入相加后单独注入，而原始 Stable Audio global 条件仍需保留自己的通道。
+  - **论文原文**：
+    ```31:33:SAGA_SR_analysis.md
+    - **嵌入提取**: 使用 T5-base 768 维文本嵌入
+    ```
+  - **当前实现**：
+    ```58:63:inference_saga_sr.py
+        self.rolloff_conditioner = RolloffFourierConditioner(
+            embedding_dim_cross=768,
+            ...
+        )
+    ```
+    ```182:203:inference_saga_sr.py
+        if rolloff_cond['cross_attn'] is not None:
+            conditioning_inputs['cross_attn_cond'] = torch.cat(
+                [conditioning_inputs['cross_attn_cond'], rolloff_cond['cross_attn']], dim=1
+            )
+    ```
+  - **说明**：推理时与训练保持 768 维 roll-off cross-attn token，可安全与 T5-base 嵌入拼接。
 
-  - **代码证据**: 
-    1. `saga_model_config.json` 的 `diffusion.global_cond_ids` 中只定义了 `["seconds_start", "seconds_total"]`，没有为 Roll-off 预留独立的 ID。
-    2. `conditioner_rolloff.py` 的 `RolloffFourierConditioner` 返回一个通用的 `'global'` 键，`train_saga_sr.py` 通过硬编码获取并与之相加，完全绕过了 `stable-audio-tools` 的条件管理机制。
+- **问题六：低频替换后处理** ✅（待验证）
 
-  - **影响分析**: 由于没有独立的通道，Roll-off 条件无法被正确地 `prepend`，只能与其他全局条件混合。这不仅不符合论文的结构要求，也使得两类特征（时长 vs. 频谱）在进入 DiT 前就被迫共享线性投影层，造成语义混淆，增加了模型的学习难度。
+  - **论文原文**：
+    ```65:70:SAGA_SR_analysis.md
+    - **后处理**: 低频替换 (Low-Frequency Replacement)
+    ```
+  - **当前实现**：
+    ```154:245:inference_saga_sr.py
+        hr_audio = self._low_frequency_replace(hr_audio, lr_audio)
+        ...
+    def _low_frequency_replace(...):
+        gen_fft = torch.fft.rfft(gen)
+        lr_fft = torch.fft.rfft(lr.to(gen.device))
+        mask = freqs <= cutoff_hz
+        gen_fft[..., mask] = lr_fft[..., mask]
+    ```
+  - **说明**：推理阶段对 200 Hz 以下频段执行幅度替换，恢复论文所述的后处理流程。
 
 
 ## 修复建议
 
-1. **立即修正 Roll-off 全局条件的注入方式**：修改 `train_saga_sr.py`，确保 Roll-off 嵌入与 `t` 的时间步嵌入相加，而不是与旧的 `global_cond` 相加，并以 prepend token 的形式送入 DiT。
-2. **保持推理与训练的 global 条件一致**：在 `_SAGASRCFGWrapper`（以及其它推理入口）中，务必同时传入原始 global 条件和 roll-off global 嵌入，避免 CFG 阶段缺失时长等信息。
-3. **在配置与条件器层面拆分 Global 通道**：更新 `saga_model_config.json`（或自定义 conditioner）为 roll-off global 注册独立的 `global_cond_id` 或 `prepend_cond_id`，保证两类 token 分别通过线性层、拼接逻辑进入模型，彻底消除语义混淆。
+上述修复已落地，需在完整训练与验证流程中确认收敛曲线、梯度稳定性及 LSD/SDR 指标；若仍有偏差，可进一步微调 Cutoff 阈值、CFG 系数等次要超参。
 

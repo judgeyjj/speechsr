@@ -17,7 +17,7 @@ class RolloffFourierConditioner(nn.Module):
     """
     
     def __init__(self, 
-                 embedding_dim_cross=256,  # Cross-Attention嵌入维度
+                 embedding_dim_cross=768,  # Cross-Attention嵌入维度
                  embedding_dim_global=1536,  # Global嵌入维度（匹配DiT）
                  dropout_rate=0.1,  # 论文标准
                  min_freq=0.0,
