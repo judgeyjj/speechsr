@@ -391,8 +391,8 @@ class SAGASRTrainer(pl.LightningModule):
         # 解码为音频
         pred_audio = self.model.pretransform.decode(pred_latent)
         
-        # 低频替换（论文标准后处理步骤）
-        pred_audio = self._low_frequency_replace(pred_audio, lr_audio)
+        # 低频替换（使用每个样本的低分辨率截止频率）
+        pred_audio = self._low_frequency_replace(pred_audio, lr_audio, rolloff_low)
 
         # 仅保存当前epoch的首个样本
         if (
@@ -477,6 +477,66 @@ class SAGASRTrainer(pl.LightningModule):
         grad_norm = self._compute_grad_norm()
         if grad_norm is not None:
             self._swanlab_log({"train/dit_grad_norm": grad_norm})
+
+    def _low_frequency_replace(
+        self,
+        generated: torch.Tensor,
+        lr_audio: torch.Tensor,
+        cutoff_hz,
+    ) -> torch.Tensor:
+        """
+        用原始低分辨率音频在其 roll-off 截止频率以下的频段替换生成音频。
+
+        Args:
+            generated: 生成的高分辨率音频 [B, C, T] 或 [B, T]
+            lr_audio: 原始低分辨率音频 [B, C, T] 或 [B, T]
+            cutoff_hz: 截止频率 (Hz)，可以是标量或 [B] 张量
+
+        Returns:
+            低频替换后的音频，与 generated 形状一致。
+        """
+        if generated.dim() == 3:
+            gen = generated.squeeze(1)
+        else:
+            gen = generated
+
+        if lr_audio.dim() == 3:
+            lr = lr_audio.squeeze(1)
+        elif lr_audio.dim() == 2:
+            lr = lr_audio
+        else:
+            lr = lr_audio.unsqueeze(0)
+
+        n = gen.shape[-1]
+        if lr.shape[-1] != n:
+            lr = F.interpolate(
+                lr.unsqueeze(1),
+                size=n,
+                mode='linear',
+                align_corners=False,
+            ).squeeze(1)
+
+        gen_fft = torch.fft.rfft(gen)
+        lr_fft = torch.fft.rfft(lr.to(gen.device))
+
+        freqs = torch.fft.rfftfreq(n, d=1.0 / 44100.0).to(gen.device)
+        if not isinstance(cutoff_hz, torch.Tensor):
+            cutoff = torch.tensor([cutoff_hz], device=gen.device, dtype=freqs.dtype)
+        else:
+            cutoff = cutoff_hz.to(gen.device, dtype=freqs.dtype)
+
+        if cutoff.dim() == 0:
+            cutoff = cutoff.unsqueeze(0)
+        cutoff = cutoff.view(-1, 1)
+
+        mask = freqs.unsqueeze(0) <= cutoff
+        gen_fft = torch.where(mask, lr_fft, gen_fft)
+
+        merged = torch.fft.irfft(gen_fft, n=n)
+
+        if generated.dim() == 3:
+            return merged.unsqueeze(1)
+        return merged
 
     def _sample_with_cfg(
         self,
@@ -573,6 +633,26 @@ class _SAGASRCFGWrapper:
         self.global_cond = conditioning_inputs.get('global_cond')
 
     def __call__(self, x: torch.Tensor, t: torch.Tensor, **kwargs):
+        rolloff_cross = self.rolloff_cond.get('cross_attn')
+        rolloff_global = self.rolloff_cond.get('global')
+        rolloff_prepend = None
+        prepend_mask = self.conditioning_inputs.get('prepend_cond_mask')
+
+        if rolloff_global is not None:
+            dit = self.base_model.model if hasattr(self.base_model, "model") else self.base_model
+            timestep_embed = dit.to_timestep_embed(dit.timestep_features(t[:, None]))
+            rolloff_prepend = rolloff_global.unsqueeze(1) + timestep_embed.unsqueeze(1)
+            if (
+                prepend_mask is None
+                or prepend_mask.shape[0] != rolloff_prepend.shape[0]
+                or prepend_mask.shape[1] != rolloff_prepend.shape[1]
+            ):
+                prepend_mask = torch.ones(
+                    rolloff_prepend.shape[:2],
+                    device=rolloff_prepend.device,
+                    dtype=torch.bool,
+                )
+
         # 1. 无条件（drop out cross/global，只保留lr_latent）
         v_uncond = self.base_model(
             x,
@@ -580,6 +660,8 @@ class _SAGASRCFGWrapper:
             input_concat_cond=self.lr_latent,
             cross_attn_cond=None,
             global_cond=None,
+            prepend_cond=None,
+            prepend_cond_mask=None,
         )
 
         # 2. 仅声学条件（global_cond 已包含原始 + roll-off）
@@ -587,18 +669,20 @@ class _SAGASRCFGWrapper:
             x,
             t,
             input_concat_cond=self.lr_latent,
-            cross_attn_cond=self.rolloff_cond['cross_attn'],
+            cross_attn_cond=rolloff_cross,
             global_cond=self.global_cond,  # 保持与训练一致
+            prepend_cond=rolloff_prepend,
+            prepend_cond_mask=prepend_mask,
         )
 
         # 3. 完整条件（文本 + 声学）
-        if self.cross_attn_text is not None:
-            cross_attn_full = torch.cat([
-                self.cross_attn_text,
-                self.rolloff_cond['cross_attn'],
-            ], dim=1)
+        if self.cross_attn_text is not None and rolloff_cross is not None:
+            cross_attn_full = torch.cat(
+                [self.cross_attn_text, rolloff_cross],
+                dim=1,
+            )
         else:
-            cross_attn_full = self.rolloff_cond['cross_attn']
+            cross_attn_full = rolloff_cross
 
         v_full = self.base_model(
             x,
@@ -606,71 +690,14 @@ class _SAGASRCFGWrapper:
             input_concat_cond=self.lr_latent,
             cross_attn_cond=cross_attn_full,
             global_cond=self.global_cond,  # 保持与训练一致
+            prepend_cond=rolloff_prepend,
+            prepend_cond_mask=prepend_mask,
         )
 
         # 多重CFG合成
         v = v_uncond + self.s_a * (v_acoustic - v_uncond) + self.s_t * (v_full - v_acoustic)
 
         return v
-    
-    def _low_frequency_replace(
-        self,
-        generated: torch.Tensor,
-        lr_audio: torch.Tensor,
-        cutoff_hz: float = 200.0,
-    ) -> torch.Tensor:
-        """
-        低频替换：用原始低分辨率音频的低频段替换生成音频的对应频段。
-        
-        Args:
-            generated: 生成的高分辨率音频 [B, C, T] 或 [B, T]
-            lr_audio: 原始低分辨率音频 [B, C, T]
-            cutoff_hz: 截止频率 (默认200Hz)
-        
-        Returns:
-            merged: 低频替换后的音频
-        """
-        # 处理维度
-        if generated.dim() == 3:
-            gen = generated.squeeze(1)  # [B, T]
-        else:
-            gen = generated
-        
-        if lr_audio.dim() == 3:
-            lr = lr_audio.squeeze(1)  # [B, T]
-        elif lr_audio.dim() == 2:
-            lr = lr_audio
-        else:
-            lr = lr_audio.unsqueeze(0)
-        
-        # 确保长度一致
-        n = gen.shape[-1]
-        if lr.shape[-1] != n:
-            lr = F.interpolate(
-                lr.unsqueeze(1),
-                size=n,
-                mode='linear',
-                align_corners=False,
-            ).squeeze(1)
-        
-        # FFT
-        gen_fft = torch.fft.rfft(gen)
-        lr_fft = torch.fft.rfft(lr.to(gen.device))
-        
-        # 频率掩码
-        freqs = torch.fft.rfftfreq(n, d=1.0 / 44100.0).to(gen.device)
-        mask = freqs <= cutoff_hz
-        
-        # 替换低频
-        gen_fft[..., mask] = lr_fft[..., mask]
-        
-        # IFFT
-        merged = torch.fft.irfft(gen_fft, n=n)
-        
-        # 恢复原始维度
-        if generated.dim() == 3:
-            return merged.unsqueeze(1)
-        return merged
 
 
 def main():
@@ -716,7 +743,8 @@ def main():
         audio_dir=args.train_dir,
         sample_rate=44100,
         duration=1.48,
-        compute_rolloff=True
+        compute_rolloff=True,
+        num_samples=65536,
     )
     
     train_loader = DataLoader(
@@ -734,7 +762,8 @@ def main():
             audio_dir=args.val_dir,
             sample_rate=44100,
             duration=1.48,
-            compute_rolloff=True
+            compute_rolloff=True,
+            num_samples=65536,
         )
         val_loader = DataLoader(
             val_dataset,

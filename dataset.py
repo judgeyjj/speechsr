@@ -19,18 +19,22 @@ class SAGASRDataset(Dataset):
     """
     
     def __init__(self, audio_dir, sample_rate=44100, duration=5.94,
-                 compute_rolloff=True):
+                 compute_rolloff=True, num_samples=None):
         """
         Args:
             audio_dir: 高分辨率音频目录
             sample_rate: 采样率 (论文标准: 44100)
             duration: 音频时长秒数 (论文标准: 5.94)
             compute_rolloff: 是否计算roll-off特征
+            num_samples: 固定采样点数（优先级高于duration）
         """
         self.audio_dir = audio_dir
         self.sample_rate = sample_rate
         self.duration = duration
-        self.num_samples = int(sample_rate * duration)
+        if num_samples is not None:
+            self.num_samples = int(num_samples)
+        else:
+            self.num_samples = int(round(sample_rate * duration))
         self.compute_rolloff = compute_rolloff
         
         # 获取所有音频文件（递归子目录，兼容大小写扩展名）

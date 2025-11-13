@@ -156,7 +156,7 @@ class SAGASRInference:
         
         # 解码
         hr_audio = self.model.pretransform.decode(hr_latent)
-        hr_audio = self._low_frequency_replace(hr_audio, lr_audio)
+        hr_audio = self._low_frequency_replace(hr_audio, lr_audio, rolloff_low)
         
         # 保存
         torchaudio.save(output_audio_path, hr_audio.cpu(), 44100)
@@ -210,10 +210,10 @@ class SAGASRInference:
         self,
         generated: torch.Tensor,
         lr_audio: torch.Tensor,
-        cutoff_hz: float = 200.0,
+        cutoff_hz,
     ) -> torch.Tensor:
         """
-        低频替换：用原始低分辨率音频的低频段替换生成音频的对应频段。
+        低频替换：用低分辨率音频在其 roll-off 截止频率以下的频段替换生成音频。
         """
         if generated.dim() == 3:
             gen = generated.squeeze(1)
@@ -239,8 +239,15 @@ class SAGASRInference:
         gen_fft = torch.fft.rfft(gen)
         lr_fft = torch.fft.rfft(lr.to(gen.device))
         freqs = torch.fft.rfftfreq(n, d=1.0 / 44100.0).to(gen.device)
-        mask = freqs <= cutoff_hz
-        gen_fft[..., mask] = lr_fft[..., mask]
+        if not isinstance(cutoff_hz, torch.Tensor):
+            cutoff = torch.tensor([cutoff_hz], device=gen.device, dtype=freqs.dtype)
+        else:
+            cutoff = cutoff_hz.to(gen.device, dtype=freqs.dtype)
+        if cutoff.dim() == 0:
+            cutoff = cutoff.unsqueeze(0)
+        cutoff = cutoff.view(-1, 1)
+        mask = freqs.unsqueeze(0) <= cutoff
+        gen_fft = torch.where(mask, lr_fft, gen_fft)
         merged = torch.fft.irfft(gen_fft, n=n)
 
         if generated.dim() == 3:
