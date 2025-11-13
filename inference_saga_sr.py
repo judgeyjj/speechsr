@@ -192,16 +192,18 @@ class SAGASRInference:
 
         conditioning = self.model.conditioner(metadata, self.device)
         conditioning_inputs = self.model.get_conditioning_inputs(conditioning)
+        text_cross_attn = conditioning_inputs.get("cross_attn_cond")
 
         if rolloff_cond['cross_attn'] is not None:
-            if conditioning_inputs.get('cross_attn_cond') is not None:
+            if text_cross_attn is not None:
                 conditioning_inputs['cross_attn_cond'] = torch.cat(
-                    [conditioning_inputs['cross_attn_cond'], rolloff_cond['cross_attn']],
+                    [text_cross_attn, rolloff_cond['cross_attn']],
                     dim=1
                 )
             else:
                 conditioning_inputs['cross_attn_cond'] = rolloff_cond['cross_attn']
 
+        conditioning_inputs['text_cross_attn_cond'] = text_cross_attn
         conditioning_inputs['rolloff_cond'] = rolloff_cond
 
         return conditioning_inputs

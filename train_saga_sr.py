@@ -85,6 +85,7 @@ class SAGASRTrainer(pl.LightningModule):
         self.val_save_audio_dir = val_save_audio_dir
         self.val_save_interval = max(1, val_save_interval)
         self._val_preview: Optional[tuple] = None
+        self.captioner: Optional[QwenAudioCaptioner] = None
         
         # 加载Stable Audio模型
         from stable_audio_tools.models.factory import create_model_from_config
@@ -112,9 +113,9 @@ class SAGASRTrainer(pl.LightningModule):
         
         # 如果使用caption，加载缓存
         self.caption_cache = None
-        if use_caption:
-            if os.path.exists('caption_cache.pt'):
-                self.caption_cache = CaptionCache('caption_cache.pt')
+        if self.use_caption:
+            self.caption_cache = CaptionCache('caption_cache.pt')
+            if len(self.caption_cache) > 0:
                 print(f"Caption cache loaded: {len(self.caption_cache)} entries")
 
         if self.swanlab_run is not None:
@@ -255,16 +256,10 @@ class SAGASRTrainer(pl.LightningModule):
         # 每个metadata字典必须包含所有conditioning keys
         for i, m in enumerate(metadata):
             # 1. 文本条件
-            if self.use_caption and self.caption_cache is not None:
-                audio_path = m['audio_path']
-                caption = self.caption_cache.get(audio_path, "")
-                
-                # 论文标准: 10% text dropout for CFG training
-                if random.random() < 0.1:
-                    caption = ""  # 无条件
-            else:
+            caption = self._resolve_caption(metadata[i])
+            # 论文标准: 10% text dropout for CFG training
+            if self.use_caption and random.random() < 0.1:
                 caption = ""
-            
             m['prompt'] = caption
             
             # 2. 时间条件（Stable Audio必需）
@@ -351,7 +346,7 @@ class SAGASRTrainer(pl.LightningModule):
         
         # 准备metadata
         for i, m in enumerate(metadata):
-            m['prompt'] = ""  # 验证时不使用caption
+            m['prompt'] = self._resolve_caption(m, training=False)
             m['seconds_start'] = 0
             m['seconds_total'] = 1.48
             if 'padding_mask' not in m:
@@ -366,23 +361,26 @@ class SAGASRTrainer(pl.LightningModule):
         rolloff_cond = self.rolloff_conditioner(rolloff_low, rolloff_high, apply_dropout=False)
         
         conditioning_inputs = self.model.get_conditioning_inputs(conditioning)
+        text_cross_attn = conditioning_inputs.get('cross_attn_cond')
         
         if rolloff_cond['cross_attn'] is not None:
-            if conditioning_inputs.get('cross_attn_cond') is not None:
+            if text_cross_attn is not None:
                 conditioning_inputs['cross_attn_cond'] = torch.cat([
-                    conditioning_inputs['cross_attn_cond'],
+                    text_cross_attn,
                     rolloff_cond['cross_attn']
                 ], dim=1)
             else:
                 conditioning_inputs['cross_attn_cond'] = rolloff_cond['cross_attn']
         
         conditioning_inputs['input_concat_cond'] = lr_latent
+        conditioning_inputs_sampling = conditioning_inputs.copy()
+        conditioning_inputs_sampling['text_cross_attn_cond'] = text_cross_attn
 
         pred_latent = self._sample_with_cfg(
             batch_size=hr_audio.shape[0],
             lr_latent=lr_latent,
             rolloff_cond=rolloff_cond,
-            conditioning_inputs=conditioning_inputs,
+            conditioning_inputs=conditioning_inputs_sampling,
             num_steps=100,
             guidance_scale_acoustic=1.4,
             guidance_scale_text=1.2,
@@ -471,6 +469,13 @@ class SAGASRTrainer(pl.LightningModule):
 
         self._val_preview = None
 
+    def on_train_end(self):
+        if self.use_caption and self.caption_cache is not None and len(self.caption_cache) > 0:
+            try:
+                self.caption_cache.save()
+            except Exception as exc:
+                print(f"[Caption] Failed to save cache: {exc}")
+
     def on_after_backward(self):
         if self.swanlab_run is None:
             return
@@ -537,6 +542,54 @@ class SAGASRTrainer(pl.LightningModule):
         if generated.dim() == 3:
             return merged.unsqueeze(1)
         return merged
+
+    def _resolve_caption(self, metadata_entry: dict, training: bool = True) -> str:
+        """
+        根据优先级获取caption:
+        1. 预生成缓存
+        2. 数据集中附带的文本 (transcript)
+        3. Qwen音频字幕生成
+        4. 退化为空字符串
+        """
+        if not self.use_caption:
+            return metadata_entry.get('transcript', "")
+
+        audio_path = metadata_entry.get('audio_path')
+
+        # 1. 缓存
+        if self.caption_cache is not None and audio_path is not None:
+            cached = self.caption_cache.get(audio_path)
+            if cached:
+                return cached
+
+        # 2. 数据集转录
+        transcript = metadata_entry.get('transcript')
+        if transcript:
+            return transcript
+
+        # 3. 在线生成（懒加载）
+        try:
+            self._ensure_captioner()
+            if self.captioner is not None and audio_path is not None:
+                caption = self.captioner.generate_caption(
+                    audio_path,
+                    use_hr_audio=training,
+                )
+                if self.caption_cache is not None and caption:
+                    self.caption_cache.add(audio_path, caption)
+                return caption
+        except Exception as exc:
+            print(f"[Caption] generation failed for {audio_path}: {exc}")
+
+        return ""
+
+    def _ensure_captioner(self):
+        if self.captioner is None:
+            try:
+                self.captioner = QwenAudioCaptioner(mode='local')
+            except Exception as exc:
+                print(f"[Caption] Unable to initialize captioner: {exc}")
+                self.captioner = None
 
     def _sample_with_cfg(
         self,
@@ -622,21 +675,22 @@ class _SAGASRCFGWrapper:
         self.base_model = base_model
         self.lr_latent = lr_latent
         self.rolloff_cond = rolloff_cond
-        self.conditioning_inputs = conditioning_inputs
         self.s_a = s_a
         self.s_t = s_t
         self.device = device
 
-        # 提前准备文本条件和组合后的 global 条件
-        self.cross_attn_text = conditioning_inputs.get('cross_attn_cond')
+        # 提前准备文本条件与完整 cross-attn，避免在采样时重复拼接
+        self.cross_attn_text = conditioning_inputs.get('text_cross_attn_cond')
+        self.cross_attn_full = conditioning_inputs.get('cross_attn_cond')
         # global_cond 已经是 (原始 + roll-off) 的组合，保持一致性
         self.global_cond = conditioning_inputs.get('global_cond')
+        self.prepend_mask = conditioning_inputs.get('prepend_cond_mask')
 
     def __call__(self, x: torch.Tensor, t: torch.Tensor, **kwargs):
         rolloff_cross = self.rolloff_cond.get('cross_attn')
         rolloff_global = self.rolloff_cond.get('global')
         rolloff_prepend = None
-        prepend_mask = self.conditioning_inputs.get('prepend_cond_mask')
+        prepend_mask = self.prepend_mask
 
         if rolloff_global is not None:
             dit = self.base_model.model if hasattr(self.base_model, "model") else self.base_model
@@ -676,13 +730,15 @@ class _SAGASRCFGWrapper:
         )
 
         # 3. 完整条件（文本 + 声学）
-        if self.cross_attn_text is not None and rolloff_cross is not None:
-            cross_attn_full = torch.cat(
-                [self.cross_attn_text, rolloff_cross],
-                dim=1,
-            )
-        else:
-            cross_attn_full = rolloff_cross
+        cross_attn_full = self.cross_attn_full
+        if cross_attn_full is None:
+            if self.cross_attn_text is not None and rolloff_cross is not None:
+                cross_attn_full = torch.cat(
+                    [self.cross_attn_text, rolloff_cross],
+                    dim=1,
+                )
+            else:
+                cross_attn_full = rolloff_cross
 
         v_full = self.base_model(
             x,
@@ -722,7 +778,9 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=1e-5,
                        help='Learning rate (论文标准: 1e-5)')
     parser.add_argument('--use_caption', action='store_true',
-                       help='Use text captions')
+                       help='Use text captions (默认已开启)')
+    parser.add_argument('--disable_caption', action='store_true',
+                       help='Disable text captions (override default enablement)')
     parser.add_argument('--output_dir', type=str, default='outputs',
                        help='Output directory')
     parser.add_argument('--checkpoint', type=str, default=None,
@@ -781,10 +839,15 @@ def main():
             project="saga-sr",
             experiment="baseline",  # 可以起个喜欢的名字
         )
+    use_caption = True
+    if args.disable_caption:
+        use_caption = False
+    elif args.use_caption:
+        use_caption = True
     model = SAGASRTrainer(
         model_config_path=args.model_config,
         learning_rate=args.learning_rate,
-        use_caption=args.use_caption,
+        use_caption=use_caption,
         swanlab_run=swanlab_run,
         val_save_audio_dir=args.val_save_audio_dir,
         val_save_interval=args.val_save_interval

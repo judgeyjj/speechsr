@@ -15,7 +15,7 @@ class SAGASRDataset(Dataset):
     - 使用低通滤波器（4种随机）生成低分辨率音频
     - 截止频率: 2-16kHz 均匀随机
     - 滤波器阶数: 2-10 随机
-    - 音频长度: 5.94秒 (44.1kHz下为262144采样点)
+    - 音频长度: 1.48秒 (44.1kHz下为65536采样点) 这里和论文不一样，在训练代码里面体现了
     """
     
     def __init__(self, audio_dir, sample_rate=44100, duration=5.94,
@@ -91,6 +91,15 @@ class SAGASRDataset(Dataset):
             'lr_audio': lr_audio,
             'audio_path': audio_path
         }
+        
+        # 读取文本转录（若存在同名 .txt）
+        transcript_path = os.path.splitext(audio_path)[0] + ".txt"
+        if os.path.isfile(transcript_path):
+            try:
+                with open(transcript_path, "r", encoding="utf-8") as f:
+                    metadata["transcript"] = f.read().strip()
+            except Exception as exc:
+                print(f"[Dataset] Failed to read transcript for {audio_path}: {exc}")
         
         # 计算roll-off特征（如果需要）
         if self.compute_rolloff:

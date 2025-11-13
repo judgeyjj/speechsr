@@ -16,6 +16,7 @@ class ConditioningBundle:
     lr_latent: torch.Tensor
     rolloff_cond: Dict[str, Optional[torch.Tensor]]
     cross_attn_text: Optional[torch.Tensor]
+    cross_attn_full: Optional[torch.Tensor]
     global_cond: Optional[torch.Tensor]
     prepend_mask: Optional[torch.Tensor] = None
 
@@ -39,6 +40,8 @@ class SAGASRCFGWrapper:
         lr_latent = self.bundle.lr_latent
         rolloff_cross = self.bundle.rolloff_cond.get("cross_attn")
         rolloff_global = self.bundle.rolloff_cond.get("global")
+        cross_attn_text = self.bundle.cross_attn_text
+        cross_attn_full = self.bundle.cross_attn_full
 
         rolloff_prepend = None
         prepend_mask = self.bundle.prepend_mask
@@ -80,12 +83,11 @@ class SAGASRCFGWrapper:
         )
 
         # 3. 完整条件（文本 + roll-off）
-        if self.bundle.cross_attn_text is not None and rolloff_cross is not None:
-            cross_attn_full = torch.cat(
-                [self.bundle.cross_attn_text, rolloff_cross], dim=1
-            )
-        else:
-            cross_attn_full = rolloff_cross
+        if cross_attn_full is None:
+            if cross_attn_text is not None and rolloff_cross is not None:
+                cross_attn_full = torch.cat([cross_attn_text, rolloff_cross], dim=1)
+            else:
+                cross_attn_full = rolloff_cross
 
         v_full = self.base_model(
             x,
@@ -118,7 +120,8 @@ def sample_cfg_euler(
     bundle = ConditioningBundle(
         lr_latent=lr_latent,
         rolloff_cond=rolloff_cond,
-        cross_attn_text=conditioning_inputs.get("cross_attn_cond"),
+        cross_attn_text=conditioning_inputs.get("text_cross_attn_cond"),
+        cross_attn_full=conditioning_inputs.get("cross_attn_cond"),
         global_cond=conditioning_inputs.get("global_cond"),
         prepend_mask=conditioning_inputs.get("prepend_cond_mask"),
     )
