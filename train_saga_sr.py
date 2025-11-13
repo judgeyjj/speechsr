@@ -390,6 +390,9 @@ class SAGASRTrainer(pl.LightningModule):
         
         # 解码为音频
         pred_audio = self.model.pretransform.decode(pred_latent)
+        
+        # 低频替换（论文标准后处理步骤）
+        pred_audio = self._low_frequency_replace(pred_audio, lr_audio)
 
         # 仅保存当前epoch的首个样本
         if (
@@ -609,6 +612,65 @@ class _SAGASRCFGWrapper:
         v = v_uncond + self.s_a * (v_acoustic - v_uncond) + self.s_t * (v_full - v_acoustic)
 
         return v
+    
+    def _low_frequency_replace(
+        self,
+        generated: torch.Tensor,
+        lr_audio: torch.Tensor,
+        cutoff_hz: float = 200.0,
+    ) -> torch.Tensor:
+        """
+        低频替换：用原始低分辨率音频的低频段替换生成音频的对应频段。
+        
+        Args:
+            generated: 生成的高分辨率音频 [B, C, T] 或 [B, T]
+            lr_audio: 原始低分辨率音频 [B, C, T]
+            cutoff_hz: 截止频率 (默认200Hz)
+        
+        Returns:
+            merged: 低频替换后的音频
+        """
+        # 处理维度
+        if generated.dim() == 3:
+            gen = generated.squeeze(1)  # [B, T]
+        else:
+            gen = generated
+        
+        if lr_audio.dim() == 3:
+            lr = lr_audio.squeeze(1)  # [B, T]
+        elif lr_audio.dim() == 2:
+            lr = lr_audio
+        else:
+            lr = lr_audio.unsqueeze(0)
+        
+        # 确保长度一致
+        n = gen.shape[-1]
+        if lr.shape[-1] != n:
+            lr = F.interpolate(
+                lr.unsqueeze(1),
+                size=n,
+                mode='linear',
+                align_corners=False,
+            ).squeeze(1)
+        
+        # FFT
+        gen_fft = torch.fft.rfft(gen)
+        lr_fft = torch.fft.rfft(lr.to(gen.device))
+        
+        # 频率掩码
+        freqs = torch.fft.rfftfreq(n, d=1.0 / 44100.0).to(gen.device)
+        mask = freqs <= cutoff_hz
+        
+        # 替换低频
+        gen_fft[..., mask] = lr_fft[..., mask]
+        
+        # IFFT
+        merged = torch.fft.irfft(gen_fft, n=n)
+        
+        # 恢复原始维度
+        if generated.dim() == 3:
+            return merged.unsqueeze(1)
+        return merged
 
 
 def main():

@@ -74,7 +74,7 @@ class SAGASRCFGWrapper:
             t,
             input_concat_cond=lr_latent,
             cross_attn_cond=rolloff_cross,
-            global_cond=self.global_cond,
+            global_cond=self.bundle.global_cond,
             prepend_cond=rolloff_prepend,
             prepend_cond_mask=prepend_mask,
         )
@@ -92,7 +92,7 @@ class SAGASRCFGWrapper:
             t,
             input_concat_cond=lr_latent,
             cross_attn_cond=cross_attn_full,
-            global_cond=self.global_cond,
+            global_cond=self.bundle.global_cond,
             prepend_cond=rolloff_prepend,
             prepend_cond_mask=prepend_mask,
         )
