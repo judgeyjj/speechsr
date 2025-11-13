@@ -3,6 +3,7 @@ import json
 import math
 import random
 import torch
+import torchaudio
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -64,12 +65,16 @@ class SAGASRTrainer(pl.LightningModule):
     - 训练步数: 26,000
     """
     
-    def __init__(self, model_config_path, learning_rate=1e-5, use_caption=False, swanlab_run: Optional[object] = None):
+    def __init__(self, model_config_path, learning_rate=1e-5, use_caption=False,
+                 swanlab_run: Optional[object] = None, val_save_audio_dir: Optional[str] = None,
+                 val_save_interval: int = 1):
         """
         Args:
             model_config_path: Stable Audio模型配置文件路径
             learning_rate: 学习率 (论文标准: 1e-5)
             use_caption: 是否使用文本caption
+            val_save_audio_dir: 验证阶段保存模型生成音频的目录（默认不保存）
+            val_save_interval: 保存频率（单位：epoch），最小为1
         """
         super().__init__()
         self.save_hyperparameters(ignore=['swanlab_run'])
@@ -77,6 +82,9 @@ class SAGASRTrainer(pl.LightningModule):
         self.lr = learning_rate
         self.use_caption = use_caption
         self.swanlab_run = swanlab_run
+        self.val_save_audio_dir = val_save_audio_dir
+        self.val_save_interval = max(1, val_save_interval)
+        self._val_preview: Optional[tuple] = None
         
         # 加载Stable Audio模型
         from stable_audio_tools.models.factory import create_model_from_config
@@ -111,6 +119,9 @@ class SAGASRTrainer(pl.LightningModule):
 
         if self.swanlab_run is not None:
             print("SwanLab logging is enabled.")
+
+    def on_validation_epoch_start(self):
+        self._val_preview = None
 
     def _freeze_non_dit_modules(self):
         """冻结Stable Audio中除DiT之外的模块参数，与论文保持一致。"""
@@ -258,7 +269,7 @@ class SAGASRTrainer(pl.LightningModule):
             
             # 2. 时间条件（Stable Audio必需）
             m['seconds_start'] = 0
-            m['seconds_total'] = 5.94
+            m['seconds_total'] = 1.48
             
             # 3. padding_mask（Stable Audio需要）
             if 'padding_mask' not in m:
@@ -342,7 +353,7 @@ class SAGASRTrainer(pl.LightningModule):
         for i, m in enumerate(metadata):
             m['prompt'] = ""  # 验证时不使用caption
             m['seconds_start'] = 0
-            m['seconds_total'] = 5.94
+            m['seconds_total'] = 1.48
             if 'padding_mask' not in m:
                 m['padding_mask'] = torch.ones(hr_audio.shape[-1], dtype=torch.bool)
         
@@ -379,6 +390,24 @@ class SAGASRTrainer(pl.LightningModule):
         
         # 解码为音频
         pred_audio = self.model.pretransform.decode(pred_latent)
+
+        # 仅保存当前epoch的首个样本
+        if (
+            self.val_save_audio_dir is not None
+            and not self.trainer.sanity_checking
+            and self._val_preview is None
+        ):
+            base_name = os.path.splitext(os.path.basename(metadata[0]['audio_path']))[0]
+            preview_audio = pred_audio[0].detach().cpu()
+            # 保存要求: torchaudio.save 对 WAV 期望 float32/PCM 等，避免混合精度下的 float16
+            if preview_audio.dtype != torch.float32:
+                preview_audio = preview_audio.float()
+            if preview_audio.dim() == 1:
+                preview_audio = preview_audio.unsqueeze(0)
+            self._val_preview = (
+                preview_audio.contiguous(),
+                base_name,
+            )
         
         # 计算LSD和SI-SDR
         pred_audio_flat = pred_audio.cpu().flatten()
@@ -406,6 +435,38 @@ class SAGASRTrainer(pl.LightningModule):
         })
 
         return {'val_lsd': lsd, 'val_si_sdr': si_sdr}
+
+    def on_validation_epoch_end(self):
+        if self.val_save_audio_dir is None or self.trainer.sanity_checking:
+            self._val_preview = None
+            return
+
+        if self.current_epoch % self.val_save_interval != 0:
+            self._val_preview = None
+            return
+
+        if self._val_preview is None:
+            return
+
+        preview_audio, base_name = self._val_preview
+        if preview_audio.dim() == 3:
+            preview_audio = preview_audio.squeeze(0)
+        if preview_audio.dim() == 1:
+            preview_audio = preview_audio.unsqueeze(0)
+        # 确保为 float32 并限制幅度到 [-1, 1]
+        if preview_audio.dtype != torch.float32:
+            preview_audio = preview_audio.float()
+        preview_audio = preview_audio.clamp_(-1.0, 1.0)
+
+        epoch_dir = os.path.join(self.val_save_audio_dir, f"epoch_{self.current_epoch:04d}")
+        os.makedirs(epoch_dir, exist_ok=True)
+        output_path = os.path.join(epoch_dir, f"pred_{base_name}.wav")
+
+        sample_rate = self.config.get('sample_rate', 44100)
+        torchaudio.save(output_path, preview_audio.contiguous(), sample_rate)
+        print(f"[Validation] Saved preview audio: {output_path}")
+
+        self._val_preview = None
 
     def on_after_backward(self):
         if self.swanlab_run is None:
@@ -577,6 +638,10 @@ def main():
                        help='Output directory')
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Resume from checkpoint')
+    parser.add_argument('--val_save_audio_dir', type=str, default=None,
+                       help='Directory to save one validation preview audio per epoch')
+    parser.add_argument('--val_save_interval', type=int, default=1,
+                       help='Save validation preview every N epochs (default: 1)')
     
     args = parser.parse_args()
     
@@ -588,7 +653,7 @@ def main():
     train_dataset = SAGASRDataset(
         audio_dir=args.train_dir,
         sample_rate=44100,
-        duration=5.94,
+        duration=1.48,
         compute_rolloff=True
     )
     
@@ -606,7 +671,7 @@ def main():
         val_dataset = SAGASRDataset(
             audio_dir=args.val_dir,
             sample_rate=44100,
-            duration=5.94,
+            duration=1.48,
             compute_rolloff=True
         )
         val_loader = DataLoader(
@@ -629,7 +694,9 @@ def main():
         model_config_path=args.model_config,
         learning_rate=args.learning_rate,
         use_caption=args.use_caption,
-        swanlab_run = swanlab_run
+        swanlab_run=swanlab_run,
+        val_save_audio_dir=args.val_save_audio_dir,
+        val_save_interval=args.val_save_interval
     )
     
     # Callbacks

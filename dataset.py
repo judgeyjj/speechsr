@@ -18,7 +18,7 @@ class SAGASRDataset(Dataset):
     - 音频长度: 5.94秒 (44.1kHz下为262144采样点)
     """
     
-    def __init__(self, audio_dir, sample_rate=44100, duration=5.94, 
+    def __init__(self, audio_dir, sample_rate=44100, duration=5.94,
                  compute_rolloff=True):
         """
         Args:
@@ -81,7 +81,7 @@ class SAGASRDataset(Dataset):
         # 生成低分辨率音频（论文标准：低通滤波）
         lr_audio = self._apply_lowpass_filter(hr_audio[0].numpy())
         lr_audio = torch.from_numpy(lr_audio).unsqueeze(0).float()
-        
+
         # 准备metadata
         metadata = {
             'lr_audio': lr_audio,
