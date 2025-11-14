@@ -315,14 +315,48 @@ def pregenerate_captions(audio_dir,
     # 获取所有音频文件（递归）
     audio_files = []
     exts = {'.wav', '.mp3', '.flac', '.ogg', '.m4a'}
-    for root, _, files in os.walk(audio_dir):
+    
+    # 调试：检查目录是否存在
+    if not os.path.exists(audio_dir):
+        raise FileNotFoundError(f"Audio directory does not exist: {audio_dir}")
+    
+    print(f"Scanning directory: {audio_dir}")
+    scanned_dirs = 0
+    scanned_files = 0
+    
+    for root, dirs, files in os.walk(audio_dir):
+        scanned_dirs += 1
         for name in files:
-            if os.path.splitext(name)[1].lower() in exts:
-                audio_files.append(os.path.join(root, name))
+            scanned_files += 1
+            ext = os.path.splitext(name)[1].lower()
+            if ext in exts:
+                full_path = os.path.join(root, name)
+                audio_files.append(full_path)
+            elif scanned_files <= 10:  # 打印前10个非音频文件作为调试信息
+                print(f"  [跳过] {os.path.join(root, name)} (扩展名: {ext or '无'})")
 
     audio_files.sort()
-
+    
+    print(f"Scanned {scanned_dirs} directories, {scanned_files} files")
     print(f"Found {len(audio_files)} audio files")
+    
+    if len(audio_files) == 0:
+        print(f"\n警告: 未找到任何音频文件！")
+        print(f"请检查:")
+        print(f"  1. 目录路径是否正确: {audio_dir}")
+        print(f"  2. 子目录中是否包含 .wav/.mp3/.flac 等音频文件")
+        print(f"  3. 文件权限是否允许读取")
+        # 列出前几个子目录作为提示
+        try:
+            subdirs = [d for d in os.listdir(audio_dir) if os.path.isdir(os.path.join(audio_dir, d))][:5]
+            if subdirs:
+                print(f"\n发现子目录示例: {', '.join(subdirs)}")
+                # 检查第一个子目录的内容
+                first_subdir = os.path.join(audio_dir, subdirs[0])
+                first_files = os.listdir(first_subdir)[:5]
+                print(f"  子目录 '{subdirs[0]}' 中的文件示例: {', '.join(first_files)}")
+        except Exception as e:
+            print(f"  无法列出子目录: {e}")
     
     # 生成caption
     for audio_path in tqdm(audio_files, desc="Generating captions"):
