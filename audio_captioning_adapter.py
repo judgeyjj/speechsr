@@ -289,7 +289,7 @@ class CaptionCache:
         return len(self.cache)
 
 
-def pregenerate_captions(audio_dir, 
+def pregenerate_captions(audio_dir,
                         output_cache='caption_cache.pt',
                         mode='local',
                         use_hr_audio=True):
@@ -305,18 +305,23 @@ def pregenerate_captions(audio_dir,
     Returns:
         cache: CaptionCache对象
     """
-    import glob
+    import os
     from tqdm import tqdm
-    
+
     # 初始化captioner
     captioner = QwenAudioCaptioner(mode=mode)
     cache = CaptionCache(output_cache)
-    
-    # 获取所有音频文件
-    audio_files = glob.glob(os.path.join(audio_dir, '*.wav'))
-    audio_files += glob.glob(os.path.join(audio_dir, '*.mp3'))
-    audio_files += glob.glob(os.path.join(audio_dir, '*.flac'))
-    
+
+    # 获取所有音频文件（递归）
+    audio_files = []
+    exts = {'.wav', '.mp3', '.flac', '.ogg', '.m4a'}
+    for root, _, files in os.walk(audio_dir):
+        for name in files:
+            if os.path.splitext(name)[1].lower() in exts:
+                audio_files.append(os.path.join(root, name))
+
+    audio_files.sort()
+
     print(f"Found {len(audio_files)} audio files")
     
     # 生成caption
