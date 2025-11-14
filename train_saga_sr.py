@@ -86,6 +86,9 @@ class SAGASRTrainer(pl.LightningModule):
         self.val_save_interval = max(1, val_save_interval)
         self._val_preview: Optional[tuple] = None
         self.captioner: Optional[QwenAudioCaptioner] = None
+        # 避免频繁初始化字幕模型：仅尝试一次，失败则不再重试
+        self._captioner_init_attempted: bool = False
+        self._captioner_init_failed: bool = False
         
         # 加载Stable Audio模型
         from stable_audio_tools.models.factory import create_model_from_config
@@ -264,12 +267,12 @@ class SAGASRTrainer(pl.LightningModule):
             
             # 2. 时间条件（Stable Audio必需）
             m['seconds_start'] = 0
-            m['seconds_total'] = 1.48
+            m['seconds_total'] = hr_audio.shape[-1] / float(self.config.get('sample_rate', 44100))
             
             # 3. padding_mask（Stable Audio需要）
             if 'padding_mask' not in m:
-                # 创建全1的padding mask（表示全部是有效音频）
-                m['padding_mask'] = torch.ones(hr_audio.shape[-1], dtype=torch.bool)
+                # 无填充：全部为 False
+                m['padding_mask'] = torch.zeros(hr_audio.shape[-1], dtype=torch.bool)
         
         # 使用Stable Audio的conditioner处理metadata
         conditioning = self.model.conditioner(metadata, self.device)
@@ -348,9 +351,9 @@ class SAGASRTrainer(pl.LightningModule):
         for i, m in enumerate(metadata):
             m['prompt'] = self._resolve_caption(m, training=False)
             m['seconds_start'] = 0
-            m['seconds_total'] = 1.48
+            m['seconds_total'] = hr_audio.shape[-1] / float(self.config.get('sample_rate', 44100))
             if 'padding_mask' not in m:
-                m['padding_mask'] = torch.ones(hr_audio.shape[-1], dtype=torch.bool)
+                m['padding_mask'] = torch.zeros(hr_audio.shape[-1], dtype=torch.bool)
         
         # 使用模型生成高分辨率音频
         conditioning = self.model.conditioner(metadata, self.device)
@@ -551,23 +554,24 @@ class SAGASRTrainer(pl.LightningModule):
         3. Qwen音频字幕生成
         4. 退化为空字符串
         """
-        if not self.use_caption:
-            return metadata_entry.get('transcript', "")
-
         audio_path = metadata_entry.get('audio_path')
 
-        # 1. 缓存
+        # 1) 优先使用缓存（即使 use_caption=False 也可用）
         if self.caption_cache is not None and audio_path is not None:
             cached = self.caption_cache.get(audio_path)
             if cached:
                 return cached
 
-        # 2. 数据集转录
+        # 2) 其次使用数据集自带转录
         transcript = metadata_entry.get('transcript')
         if transcript:
             return transcript
 
-        # 3. 在线生成（懒加载）
+        # 3) 若显式禁用字幕则直接返回空
+        if not self.use_caption:
+            return ""
+
+        # 4) 在线生成（仅在允许字幕、且未确认失败时尝试一次）
         try:
             self._ensure_captioner()
             if self.captioner is not None and audio_path is not None:
@@ -584,12 +588,20 @@ class SAGASRTrainer(pl.LightningModule):
         return ""
 
     def _ensure_captioner(self):
-        if self.captioner is None:
-            try:
-                self.captioner = QwenAudioCaptioner(mode='local')
-            except Exception as exc:
-                print(f"[Caption] Unable to initialize captioner: {exc}")
-                self.captioner = None
+        # 已尝试初始化则直接返回，避免多次下载/阻塞
+        if self._captioner_init_attempted:
+            return
+        self._captioner_init_attempted = True
+        try:
+            self.captioner = QwenAudioCaptioner(mode='local')
+            self._captioner_init_failed = False
+        except Exception as exc:
+            print(f"[Caption] Unable to initialize captioner: {exc}")
+            # 初始化失败：不再重试，且避免后续在线生成尝试
+            self.captioner = None
+            self._captioner_init_failed = True
+            # 保留缓存/转录路径，但关闭在线字幕生成
+            self.use_caption = False
 
     def _sample_with_cfg(
         self,

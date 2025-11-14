@@ -1,30 +1,44 @@
 import os
+import warnings
+
 import torch
-from typing import Union, Optional
+from typing import Optional
 
 
 class QwenAudioCaptioner:
     """
-    Qwen2-Audio音频转文本适配器
-    
+    Qwen2-Audio 音频转文本适配器
+
     论文要求:
-    - 训练阶段: 从高分辨率音频生成caption
-    - 推理阶段: 从低分辨率音频生成caption
-    - 返回文本字符串，直接传给T5编码器
-    
-    支持两种模式:
-    1. local: 本地加载Qwen2-Audio模型
-    2. api: 调用Qwen API
+    - 训练阶段: 从高分辨率音频生成 caption
+    - 推理阶段: 从低分辨率音频生成 caption
+    - 返回纯文本字符串
+
+    模式:
+    1) local: 本地加载 Qwen2-Audio 模型
+    2) api:   调用云端 API
     """
-    
-    def __init__(self, mode='local', model_name="Qwen/Qwen2-Audio-7B-Instruct"):
+
+    _DEFAULT_MODEL_ID = "Qwen/Qwen2-Audio-7B-Instruct"
+
+    def __init__(self, mode: str = 'local', model_name: Optional[str] = None):
         """
         Args:
             mode: 'local' 或 'api'
-            model_name: 模型名称（本地模式）
+            model_name: 模型名称（若为空则读取环境变量 QWEN_AUDIO_MODEL）
         """
         self.mode = mode
-        self.model_name = model_name
+        env_model = os.getenv('QWEN_AUDIO_MODEL')
+        selected_model = model_name or env_model or self._DEFAULT_MODEL_ID
+
+        if 'qwen2-audio' not in selected_model.lower():
+            warnings.warn(
+                f"指定的模型 `{selected_model}` 非 Qwen2-Audio，已回退至 {self._DEFAULT_MODEL_ID}",
+                UserWarning,
+            )
+            selected_model = self._DEFAULT_MODEL_ID
+
+        self.model_name = selected_model
         
         if mode == 'local':
             self._init_local_model()
@@ -32,26 +46,26 @@ class QwenAudioCaptioner:
             self._init_api()
         else:
             raise ValueError(f"Unknown mode: {mode}. Must be 'local' or 'api'")
-    
+
     def _init_local_model(self):
-        """初始化本地Qwen2-Audio模型"""
+        """初始化本地 Qwen2-Audio 模型"""
         try:
-            from transformers import AutoModelForCausalLM, AutoProcessor
+            from transformers import AutoProcessor, Qwen2AudioForConditionalGeneration
             
             print(f"Loading Qwen2-Audio model: {self.model_name}")
             
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                trust_remote_code=True
-            )
-            
             self.processor = AutoProcessor.from_pretrained(
                 self.model_name,
-                trust_remote_code=True
+                trust_remote_code=True,
             )
             
+            self.model = Qwen2AudioForConditionalGeneration.from_pretrained(
+                self.model_name,
+                dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+
             self.device = next(self.model.parameters()).device
             print(f"Model loaded on device: {self.device}")
             
@@ -61,6 +75,10 @@ class QwenAudioCaptioner:
                 "Please run: pip install transformers"
             )
         except Exception as e:
+            warnings.warn(
+                f"[Caption] 无法加载 Qwen2-Audio 模型 (`{self.model_name}`): {e}",
+                RuntimeWarning,
+            )
             raise RuntimeError(f"Failed to load Qwen2-Audio model: {e}")
     
     def _init_api(self):
@@ -124,12 +142,15 @@ class QwenAudioCaptioner:
                 tokenize=False
             )
             
-            inputs = self.processor(
-                text=[text],
-                audios=[audio_path],
-                return_tensors="pt",
-                padding=True
-            )
+            if hasattr(self.processor, "__call__"):
+                inputs = self.processor(
+                    text=[text],
+                    audios=[audio_path],
+                    return_tensors="pt",
+                    padding=True,
+                )
+            else:
+                raise RuntimeError("Processor does not support direct calls for audio generation")
             
             inputs = inputs.to(self.device)
             
@@ -143,17 +164,17 @@ class QwenAudioCaptioner:
                 )
             
             # 解码
-            output_ids = output_ids[0][inputs['input_ids'].shape[1]:]
-            caption = self.processor.decode(
-                output_ids,
-                skip_special_tokens=True
-            ).strip()
+            generated_text = self.processor.batch_decode(
+                output_ids[:, inputs['input_ids'].shape[1]:],
+                skip_special_tokens=True,
+            )
+            caption = generated_text[0].strip() if generated_text else ""
             
             return caption
             
         except Exception as e:
             print(f"Local generation failed: {e}")
-            return f"Audio description (auto-generated)"
+            return ""
     
     def _generate_api(self, audio_path, prompt, max_length, temperature):
         """API生成"""
