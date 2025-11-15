@@ -96,7 +96,7 @@ class QwenAudioCaptioner:
     def generate_caption(self, 
                         audio_path: str, 
                         use_hr_audio: bool = True,
-                        max_length: int = 100,
+                        max_new_tokens: int = 200,
                         temperature: float = 0.7) -> str:
         """
         从音频生成文本描述
@@ -104,79 +104,115 @@ class QwenAudioCaptioner:
         Args:
             audio_path: 音频文件路径
             use_hr_audio: True=训练阶段(高分辨率), False=推理阶段(低分辨率)
-            max_length: 生成文本最大长度
+            max_new_tokens: 生成文本新增token上限
             temperature: 生成温度
         
         Returns:
             caption: 文本描述字符串
         """
-        # 提示词（可根据use_hr_audio调整）
+        # 语音音频提示词（区分训练/推理阶段）
         if use_hr_audio:
-            prompt = "Describe this high-quality audio in detail, including its content, style, and acoustic characteristics."
+            prompt = (
+                "Always answer in English. "
+                "You are an expert speech analyst. Listen carefully to this high-quality speech clip "
+                "and summarize the spoken content, speaker characteristics, emotion, pace, and any background sounds in English."
+            )
         else:
-            prompt = "Describe this audio in detail."
-        
+            prompt = (
+                "Always answer in English. "
+                "You are an expert speech analyst. Listen to this speech clip and briefly describe in English the key spoken content, "
+                "speaker tone or emotion, and any noticeable background noise."
+            )
+
         if self.mode == 'local':
-            return self._generate_local(audio_path, prompt, max_length, temperature)
+            return self._generate_local(audio_path, prompt, max_new_tokens, temperature)
         else:
-            return self._generate_api(audio_path, prompt, max_length, temperature)
+            return self._generate_api(audio_path, prompt, max_new_tokens, temperature)
     
-    def _generate_local(self, audio_path, prompt, max_length, temperature):
+    def _generate_local(self, audio_path, prompt, max_new_tokens, temperature):
         """本地模型生成"""
         try:
-            # 准备输入
+            import numpy as np
+            import librosa
+
+            # 构建对话模板（官方推荐）
             conversation = [
                 {
                     "role": "user",
                     "content": [
                         {"type": "audio", "audio_url": audio_path},
-                        {"type": "text", "text": prompt}
-                    ]
+                        {"type": "text", "text": prompt},
+                    ],
                 }
             ]
-            
-            # 处理输入
+
             text = self.processor.apply_chat_template(
                 conversation,
                 add_generation_prompt=True,
-                tokenize=False
+                tokenize=False,
             )
-            
-            if hasattr(self.processor, "__call__"):
-                inputs = self.processor(
-                    text=[text],
-                    audios=[audio_path],
-                    return_tensors="pt",
-                    padding=True,
-                )
-            else:
+
+            # 读取并重采样语音到模型要求的采样率
+            target_sr = getattr(self.processor.feature_extractor, "sampling_rate", None)
+            audio, sr = librosa.load(audio_path, sr=None, mono=False)
+
+            if audio.ndim == 2:
+                audio = np.mean(audio, axis=0)
+
+            if target_sr and sr != target_sr:
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+                sr = target_sr
+
+            audio = audio.astype(np.float32)
+
+            if not hasattr(self.processor, "__call__"):
                 raise RuntimeError("Processor does not support direct calls for audio generation")
-            
+
+            import inspect
+            try:
+                sig = inspect.signature(self.processor.__call__)
+            except (TypeError, ValueError):
+                sig = None
+
+            if sig and "audios" in sig.parameters:
+                audio_kwargs = {"audios": [audio]}
+            elif sig and "audio" in sig.parameters:
+                audio_kwargs = {"audio": [audio]}
+            else:
+                audio_kwargs = {"audios": [audio]}
+
+            inputs = self.processor(
+                text=[text],
+                sampling_rate=sr,
+                return_tensors="pt",
+                padding=True,
+                **audio_kwargs,
+            )
+
             inputs = inputs.to(self.device)
-            
+
             # 生成
             with torch.no_grad():
                 output_ids = self.model.generate(
                     **inputs,
-                    max_length=max_length,
+                    max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     do_sample=True
                 )
-            
+
             # 解码
             generated_text = self.processor.batch_decode(
                 output_ids[:, inputs['input_ids'].shape[1]:],
                 skip_special_tokens=True,
             )
             caption = generated_text[0].strip() if generated_text else ""
-            
+
             return caption
-            
+
         except Exception as e:
-            print(f"Local generation failed: {e}")
-            return ""
+            raise RuntimeError(f"Local generation failed: {e}") from e
     
-    def _generate_api(self, audio_path, prompt, max_length, temperature):
+    def _generate_api(self, audio_path, prompt, max_new_tokens, temperature):
         """API生成"""
         try:
             import requests
@@ -200,7 +236,7 @@ class QwenAudioCaptioner:
                     "prompt": prompt
                 },
                 "parameters": {
-                    "max_length": max_length,
+                    "max_length": max_new_tokens,
                     "temperature": temperature
                 }
             }
