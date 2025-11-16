@@ -2,6 +2,7 @@ import os
 import json
 import math
 import random
+import warnings
 import torch
 import torchaudio
 import torch.nn as nn
@@ -12,6 +13,10 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from typing import Dict, Iterable, Optional
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+torch.set_float32_matmul_precision("medium")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 try:
     import swanlab  # type: ignore
 except ImportError:
@@ -19,6 +24,7 @@ except ImportError:
 
 from stable_audio_tools.inference.sampling import sample_discrete_euler
 from stable_audio_tools.training.utils import InverseLR
+from stable_audio_tools.models.utils import load_ckpt_state_dict, copy_state_dict
 
 from dataset import SAGASRDataset
 from conditioner_rolloff import RolloffFourierConditioner, CombinedConditioner
@@ -99,6 +105,8 @@ class SAGASRTrainer(pl.LightningModule):
         self.model = create_model_from_config(config)
         self.config = config
 
+        self._load_stable_audio_pretrained()
+
         self._freeze_non_dit_modules()
         dit_core = self._get_dit()
         if not hasattr(dit_core, "to_prepend_embed"):
@@ -112,6 +120,9 @@ class SAGASRTrainer(pl.LightningModule):
             dropout_rate=0.1
         )
 
+        # 论文要求：在低分辨率latent上施加10% dropout以实现CFG
+        self.latent_dropout_prob = 0.1
+
         self._log_parameter_stats()
         
         # 如果使用caption，加载缓存
@@ -123,6 +134,30 @@ class SAGASRTrainer(pl.LightningModule):
 
         if self.swanlab_run is not None:
             print("SwanLab logging is enabled.")
+
+    def _load_stable_audio_pretrained(self):
+        root_dir = os.path.dirname(os.path.abspath(__file__))
+        model_dir = os.path.join(root_dir, "stable-audio-open-1.0")
+
+        try:
+            if not os.path.isdir(model_dir):
+                print(f"[SAGA-SR] Stable Audio pretrained directory not found: {model_dir}")
+                return
+
+            ckpt_path = os.path.join(model_dir, "model.safetensors")
+            if not os.path.exists(ckpt_path):
+                ckpt_path = os.path.join(model_dir, "model.ckpt")
+
+            if not os.path.exists(ckpt_path):
+                print(f"[SAGA-SR] Stable Audio checkpoint not found under: {model_dir}")
+                return
+
+            state_dict = load_ckpt_state_dict(ckpt_path)
+            copy_state_dict(self.model, state_dict)
+            print(f"[SAGA-SR] Loaded Stable Audio Open 1.0 pretrained weights from: {ckpt_path}")
+            self._swanlab_log({"model/pretrained_loaded": 1.0}, step=0)
+        except Exception as exc:
+            print(f"[SAGA-SR] Failed to load Stable Audio pretrained weights: {exc}")
 
     def on_validation_epoch_start(self):
         self._val_preview = None
@@ -224,6 +259,21 @@ class SAGASRTrainer(pl.LightningModule):
         rolloff_prepend = rolloff_global.unsqueeze(1) + timestep_embed.unsqueeze(1)
         return rolloff_prepend
 
+    def _apply_latent_dropout(self, latent: torch.Tensor, training: bool) -> torch.Tensor:
+        """对低分辨率latent施加CFG所需的dropout。"""
+        if not training or self.latent_dropout_prob <= 0.0:
+            return latent
+
+        if self.latent_dropout_prob >= 1.0:
+            return torch.zeros_like(latent)
+
+        keep_mask = (torch.rand(latent.shape[0], device=latent.device) >= self.latent_dropout_prob)
+        if keep_mask.all():
+            return latent
+
+        keep_mask = keep_mask.float().view(-1, 1, 1)
+        return latent * keep_mask
+
     
     def training_step(self, batch, batch_idx):
         """
@@ -243,6 +293,8 @@ class SAGASRTrainer(pl.LightningModule):
         with torch.no_grad():
             lr_latent = self.model.pretransform.encode(lr_audio)  # [B, 64, L]
             hr_latent = self.model.pretransform.encode(hr_audio.to(self.device))  # [B, 64, L]
+
+        lr_latent_cond = self._apply_latent_dropout(lr_latent, training=True)
         
         # Flow Matching (论文公式)
         batch_size = hr_audio.shape[0]
@@ -305,7 +357,7 @@ class SAGASRTrainer(pl.LightningModule):
             )
         
         # 添加SAGA-SR的input_concat_cond（低分辨率latent）
-        conditioning_inputs['input_concat_cond'] = lr_latent
+        conditioning_inputs['input_concat_cond'] = lr_latent_cond
         
         # 调用DiT模型
         v_pred = self.model.model(
@@ -317,9 +369,9 @@ class SAGASRTrainer(pl.LightningModule):
         # Flow Matching损失
         loss = F.mse_loss(v_pred, v_target)
         # 记录
-        self.log('train/loss', loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log('train/rolloff_low_mean', rolloff_low.mean(), on_step=False, on_epoch=True)
-        self.log('train/rolloff_high_mean', rolloff_high.mean(), on_step=False, on_epoch=True)
+        self.log('train/loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=batch_size)
+        self.log('train/rolloff_low_mean', rolloff_low.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log('train/rolloff_high_mean', rolloff_high.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
 
         self._swanlab_log({
             "train/loss": loss.item(),
@@ -426,10 +478,11 @@ class SAGASRTrainer(pl.LightningModule):
         si_sdr = compute_si_sdr(pred_audio_flat, hr_audio_flat)
         
         # 记录
-        self.log('val/lsd', lsd, prog_bar=True, on_step=False, on_epoch=True)
-        self.log('val/si_sdr', si_sdr, prog_bar=True, on_step=False, on_epoch=True)
-        self.log('val/rolloff_low_mean', rolloff_low.mean(), on_step=False, on_epoch=True)
-        self.log('val/rolloff_high_mean', rolloff_high.mean(), on_step=False, on_epoch=True)
+        batch_size = hr_audio.shape[0]
+        self.log('val/lsd', lsd, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log('val/si_sdr', si_sdr, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log('val/rolloff_low_mean', rolloff_low.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log('val/rolloff_high_mean', rolloff_high.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
 
         self._swanlab_log({
             "val/lsd": float(lsd),
@@ -686,6 +739,7 @@ class _SAGASRCFGWrapper:
     ):
         self.base_model = base_model
         self.lr_latent = lr_latent
+        self.lr_latent_uncond = torch.zeros_like(lr_latent)
         self.rolloff_cond = rolloff_cond
         self.s_a = s_a
         self.s_t = s_t
@@ -723,7 +777,7 @@ class _SAGASRCFGWrapper:
         v_uncond = self.base_model(
             x,
             t,
-            input_concat_cond=self.lr_latent,
+            input_concat_cond=self.lr_latent_uncond,
             cross_attn_cond=None,
             global_cond=None,
             prepend_cond=None,
@@ -889,7 +943,7 @@ def main():
         max_steps=args.max_steps,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1,
-        precision='16-mixed',
+        precision='32-true',
         accumulate_grad_batches=args.accumulate_grad_batches,  # 梯度累积
         callbacks=[checkpoint_callback, lr_monitor],
         log_every_n_steps=50,
