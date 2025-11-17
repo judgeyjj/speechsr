@@ -10,12 +10,13 @@ SAGA-SR评估脚本
 
 import os
 import json
-import torch
 import torchaudio
 import argparse
 from tqdm import tqdm
 from pathlib import Path
 import numpy as np
+import torch
+import scipy.signal as signal
 
 from inference_saga_sr import SAGASRInference
 from metrics import evaluate_audio_quality, compute_lsd, compute_si_sdr
@@ -49,6 +50,50 @@ class SAGASREvaluator:
         )
         
         print(f"Evaluator initialized on {device}")
+    
+    @staticmethod
+    def _apply_lowpass_filter_tensor(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+        """
+        在单个样本上应用与 SAGASRDataset._apply_lowpass_filter 等价的低通滤波。
+        
+        Args:
+            audio: [C, T] 或 [T] 的张量
+            sample_rate: 采样率 (Hz)
+        
+        Returns:
+            低通后的单声道音频 [1, T]
+        """
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        if audio.shape[0] > 1:
+            audio = audio.mean(dim=0, keepdim=True)
+
+        # 转为 numpy 1D
+        np_audio = audio[0].cpu().numpy().astype(np.float32)
+
+        # 与 SAGASRDataset 保持一致的随机滤波器配置
+        filter_types = ['cheby1', 'butter', 'bessel', 'ellip']
+        filter_type = np.random.choice(filter_types)
+        cutoff_freq = np.random.uniform(2000.0, 16000.0)
+        order = np.random.randint(2, 11)
+
+        try:
+            if filter_type == 'cheby1':
+                b, a = signal.cheby1(order, 0.5, cutoff_freq, btype='low', fs=sample_rate)
+            elif filter_type == 'butter':
+                b, a = signal.butter(order, cutoff_freq, btype='low', fs=sample_rate)
+            elif filter_type == 'bessel':
+                b, a = signal.bessel(order, cutoff_freq, btype='low', fs=sample_rate)
+            else:
+                b, a = signal.ellip(order, 0.5, 40, cutoff_freq, btype='low', fs=sample_rate)
+
+            filtered = signal.filtfilt(b, a, np_audio).astype(np.float32)
+        except Exception as e:
+            print(f"[Eval] Lowpass filter failed ({filter_type}, order={order}, cutoff={cutoff_freq}): {e}")
+            b, a = signal.butter(4, cutoff_freq, btype='low', fs=sample_rate)
+            filtered = signal.filtfilt(b, a, np_audio).astype(np.float32)
+
+        return torch.from_numpy(filtered).unsqueeze(0)
     
     def evaluate_dataset(self,
                         test_audio_dir,
@@ -103,14 +148,14 @@ class SAGASREvaluator:
             try:
                 # 加载高分辨率音频（ground truth）
                 hr_audio, sr = torchaudio.load(str(audio_file))
+                # 确保为单声道 [1, T]
+                if hr_audio.dim() == 2 and hr_audio.shape[0] > 1:
+                    hr_audio = hr_audio.mean(dim=0, keepdim=True)
                 
                 # 生成低分辨率输入（模拟）
-                # 这里简化处理，实际应该用dataset.py中的低通滤波
-                from dataset import SAGASRDataset
-                dataset = SAGASRDataset(audio_dir=test_audio_dir, compute_rolloff=True)
-                
-                # 临时创建低分辨率版本
-                lr_audio = dataset._apply_lowpass_filter(hr_audio)
+                # 这里重用与 dataset.SAGASRDataset._apply_lowpass_filter 一致的低通策略，
+                # 但直接在当前样本上操作，避免重复构造数据集和类型不匹配。
+                lr_audio = self._apply_lowpass_filter_tensor(hr_audio, sr)
                 lr_audio_path = os.path.join(output_dir, f'temp_lr_{audio_file.name}')
                 torchaudio.save(lr_audio_path, lr_audio, sr)
                 

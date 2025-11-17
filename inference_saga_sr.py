@@ -3,6 +3,7 @@ import json
 import torch
 import torchaudio
 import argparse
+from typing import Optional
 
 from conditioner_rolloff import RolloffFourierConditioner
 from spectral_features import compute_spectral_rolloff
@@ -81,12 +82,12 @@ class SAGASRInference:
     @torch.no_grad()
     def upsample(self,
                  input_audio_path,
-                 output_audio_path,
+                 output_audio_path: Optional[str] = None,
                  target_rolloff=16000.0,
                  num_steps=100,
                  guidance_scale_acoustic=1.4,
                  guidance_scale_text=1.2,
-                 caption=None):
+                 caption: Optional[str] = None):
         """
         音频超分辨率推理
         
@@ -109,9 +110,18 @@ class SAGASRInference:
         if sr != 44100:
             lr_audio = torchaudio.transforms.Resample(sr, 44100)(lr_audio)
         
-        # 单声道
+        # 依据模型配置的通道数进行上/下混合（官方权重通常为 2 通道）
+        target_channels = int(self.config.get("audio_channels", 1))
         if lr_audio.shape[0] > 1:
-            lr_audio = lr_audio.mean(dim=0, keepdim=True)
+            # 先统一转为 mono，再按需要复制到目标通道数
+            lr_mono = lr_audio.mean(dim=0, keepdim=True)
+        else:
+            lr_mono = lr_audio
+
+        if target_channels > 1:
+            lr_audio = lr_mono.repeat(target_channels, 1)
+        else:
+            lr_audio = lr_mono
         
         lr_audio = lr_audio.to(self.device)
         
@@ -158,9 +168,10 @@ class SAGASRInference:
         hr_audio = self.model.pretransform.decode(hr_latent)
         hr_audio = self._low_frequency_replace(hr_audio, lr_audio, rolloff_low)
         
-        # 保存
-        torchaudio.save(output_audio_path, hr_audio.cpu(), 44100)
-        print(f"Saved to: {output_audio_path}")
+        # 保存（可选）
+        if output_audio_path is not None:
+            torchaudio.save(output_audio_path, hr_audio.cpu(), 44100)
+            print(f"Saved to: {output_audio_path}")
         
         return hr_audio
     

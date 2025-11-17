@@ -19,7 +19,7 @@ class SAGASRDataset(Dataset):
     """
     
     def __init__(self, audio_dir, sample_rate=44100, duration=5.94,
-                 compute_rolloff=True, num_samples=None):
+                 compute_rolloff=True, num_samples=None, audio_channels: int = 1):
         """
         Args:
             audio_dir: 高分辨率音频目录
@@ -36,6 +36,8 @@ class SAGASRDataset(Dataset):
         else:
             self.num_samples = int(round(sample_rate * duration))
         self.compute_rolloff = compute_rolloff
+        # 目标通道数（与模型配置对齐，例如 Stable Audio 官方权重为 2 通道）
+        self.audio_channels = audio_channels
         
         # 获取所有音频文件（递归子目录，兼容大小写扩展名）
         valid_exts = ('.wav', '.mp3', '.flac')
@@ -68,7 +70,7 @@ class SAGASRDataset(Dataset):
         if sr != self.sample_rate:
             hr_audio = torchaudio.transforms.Resample(sr, self.sample_rate)(hr_audio)
         
-        # 单声道处理
+        # 单声道处理：先归一成 mono，再根据 audio_channels 再复制
         if hr_audio.shape[0] > 1:
             hr_audio = hr_audio.mean(dim=0, keepdim=True)
         
@@ -82,9 +84,16 @@ class SAGASRDataset(Dataset):
             repeats = self.num_samples // hr_audio.shape[1] + 1
             hr_audio = hr_audio.repeat(1, repeats)[:, :self.num_samples]
         
+        # 若模型为多通道（如 2 通道），在裁剪/补齐后再复制通道
+        if self.audio_channels > 1:
+            hr_audio = hr_audio.repeat(self.audio_channels, 1)
+        
         # 生成低分辨率音频（论文标准：低通滤波）
-        lr_audio = self._apply_lowpass_filter(hr_audio[0].numpy())
-        lr_audio = torch.from_numpy(lr_audio).unsqueeze(0).float()
+        # 注意：低通在单通道上进行，然后按需要复制通道
+        lr_audio_np = self._apply_lowpass_filter(hr_audio[0].cpu().numpy())
+        lr_audio = torch.from_numpy(lr_audio_np).unsqueeze(0).float()
+        if self.audio_channels > 1:
+            lr_audio = lr_audio.repeat(self.audio_channels, 1)
 
         # 准备metadata
         metadata = {
@@ -104,6 +113,7 @@ class SAGASRDataset(Dataset):
         # 计算roll-off特征（如果需要）
         if self.compute_rolloff:
             from spectral_features import compute_spectral_rolloff
+            # compute_spectral_rolloff 内部会对多通道做平均，这里取第一个通道即可
             metadata['rolloff_low'] = compute_spectral_rolloff(
                 lr_audio[0], self.sample_rate, rolloff_percent=0.985
             )
@@ -111,7 +121,8 @@ class SAGASRDataset(Dataset):
                 hr_audio[0], self.sample_rate, rolloff_percent=0.985
             )
         
-        return hr_audio.squeeze(0), metadata
+        # 返回 shape 为 [C, T] 的张量（与模型配置的 audio_channels 对齐）
+        return hr_audio, metadata
     
     def _apply_lowpass_filter(self, audio):
         """

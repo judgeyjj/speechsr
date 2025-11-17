@@ -279,10 +279,12 @@ class SAGASRTrainer(pl.LightningModule):
         """
         训练步骤
         
-        论文Flow Matching目标:
-        z_t = (1-t)*noise + t*z_h
-        v_target = z_h - noise
-        loss = ||v_pred - v_target||^2
+        Flow Matching / Rectified Flow 目标:
+        - 定义路径: z_t = (1 - t) * z_data + t * z_noise
+        - 其中: z_data = hr_latent, z_noise = noise
+        - t = 0: 纯数据, t = 1: 纯噪声
+        - 目标速度: v_target = z_noise - z_data
+        - 损失: loss = ||v_pred - v_target||^2
         """
         hr_audio, metadata = batch
         
@@ -472,7 +474,7 @@ class SAGASRTrainer(pl.LightningModule):
             lr_latent=lr_latent,
             rolloff_cond=rolloff_cond,
             conditioning_inputs=conditioning_inputs_sampling,
-            num_steps=100,
+            num_steps=getattr(self.hparams, "val_num_steps", 100),
             guidance_scale_acoustic=1.4,
             guidance_scale_text=1.2,
         )
@@ -886,10 +888,12 @@ def main():
                        help='Disable text captions (override default enablement)')
     parser.add_argument('--val_use_flowmatch', action='store_true',default = False,
                         help='验证阶段使用Flow Matching损失而非采样指标')
-    parser.add_argument('--disable_val_lowfreq_replace', action='store_true', default = True,
+    parser.add_argument('--disable_val_lowfreq_replace', action='store_true', default=True,
                         help='验证阶段关闭低频替换')
     parser.add_argument('--output_dir', type=str, default='outputs',
                        help='Output directory')
+    parser.add_argument('--val_num_steps', type=int, default=100,
+                       help='Validation sampling steps (默认与论文一致为 100，可在调试时调小以加快验证)')
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Resume from checkpoint')
     parser.add_argument('--val_save_audio_dir', type=str, default=None,
@@ -902,6 +906,11 @@ def main():
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # 读取模型配置以获取目标通道数（完整加载官方权重时应与 json 对齐）
+    with open(args.model_config) as f:
+        model_config = json.load(f)
+    audio_channels = model_config.get("audio_channels", 1)
+
     # 创建数据集
     print("Creating datasets...")
     train_dataset = SAGASRDataset(
@@ -910,6 +919,7 @@ def main():
         duration=1.48,
         compute_rolloff=True,
         num_samples=65536,
+        audio_channels=audio_channels,
     )
     
     train_loader = DataLoader(
@@ -929,6 +939,7 @@ def main():
             duration=1.48,
             compute_rolloff=True,
             num_samples=65536,
+            audio_channels=audio_channels,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -961,6 +972,7 @@ def main():
     )
     model.hparams.val_use_flowmatch = args.val_use_flowmatch
     model.hparams.disable_val_lowfreq_replace = args.disable_val_lowfreq_replace
+    model.hparams.val_num_steps = args.val_num_steps
     
     # Callbacks
     checkpoint_callback = ModelCheckpoint(
