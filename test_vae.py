@@ -40,7 +40,7 @@ model = model.to(device)
 
 # ========== 模式选择 ==========
 # 模式1: 纯文本生成
-MODE = "text_and_audio"  # 可选: "text_only", "audio_only", "text_and_audio"
+MODE = "text_only"  # 可选: "text_only", "audio_only", "text_and_audio"
 
 # 音频输入文件路径（当使用audio_only或text_and_audio模式时）
 INPUT_AUDIO_PATH = "./p360_002_8k.wav"  # 替换为你的音频文件路径
@@ -52,7 +52,7 @@ INIT_NOISE_LEVEL = 0.5  # 推荐范围: 0.3-0.8
 if MODE == "text_only":
     # 纯文本模式
     conditioning = [{
-        "prompt": "a woman speak",
+        "prompt": "'please call stella',a woman says",
         "seconds_start": 0,
         "seconds_total": 3
     }]
@@ -72,7 +72,7 @@ elif MODE == "audio_only":
 elif MODE == "text_and_audio":
     # 音频+文本模式（文本引导的音频变化）
     conditioning = [{
-        "prompt": "please upsample this audio",  # 描述你想要的变化
+        "prompt": "a female says 'please call stella'",  # 描述你想要的变化
         "seconds_start": 0,
         "seconds_total": 10
     }]

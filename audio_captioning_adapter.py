@@ -114,8 +114,8 @@ class QwenAudioCaptioner:
         if use_hr_audio:
             prompt = (
                 "Always answer in English. "
-                "You are an expert speech analyst. Listen carefully to this high-quality speech clip "
-                "and summarize the spoken content, speaker characteristics, emotion, pace, and any background sounds in English."
+                "You are an expert audio analyst. Listen carefully to this high-quality audio clip "
+                "and summarize the content, audio characteristics, emotion, pace, and any background sounds in English."
             )
         else:
             prompt = (

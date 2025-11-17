@@ -878,9 +878,9 @@ def main():
                        help='Use text captions (默认已开启)')
     parser.add_argument('--disable_caption', action='store_true',
                        help='Disable text captions (override default enablement)')
-    parser.add_argument('--val_use_flowmatch', action='store_true',
+    parser.add_argument('--val_use_flowmatch', action='store_true',default = False,
                         help='验证阶段使用Flow Matching损失而非采样指标')
-    parser.add_argument('--disable_val_lowfreq_replace', action='store_true',
+    parser.add_argument('--disable_val_lowfreq_replace', action='store_true', default = True,
                         help='验证阶段关闭低频替换')
     parser.add_argument('--output_dir', type=str, default='outputs',
                        help='Output directory')
