@@ -407,6 +407,36 @@ class SAGASRTrainer(pl.LightningModule):
             if 'padding_mask' not in m:
                 m['padding_mask'] = torch.zeros(hr_audio.shape[-1], dtype=torch.bool)
         
+        if getattr(self.hparams, "val_use_flowmatch", False):
+            conditioning = self.model.conditioner(metadata, self.device)
+            rolloff_low = torch.stack([m['rolloff_low'] for m in metadata])
+            rolloff_high = torch.stack([m['rolloff_high'] for m in metadata])
+            rolloff_cond = self.rolloff_conditioner(rolloff_low, rolloff_high, apply_dropout=False)
+            conditioning_inputs = self.model.get_conditioning_inputs(conditioning)
+            if rolloff_cond['cross_attn'] is not None:
+                if conditioning_inputs.get('cross_attn_cond') is not None:
+                    conditioning_inputs['cross_attn_cond'] = torch.cat([
+                        conditioning_inputs['cross_attn_cond'],
+                        rolloff_cond['cross_attn']
+                    ], dim=1)
+                else:
+                    conditioning_inputs['cross_attn_cond'] = rolloff_cond['cross_attn']
+            if rolloff_cond['global'] is not None:
+                rolloff_prepend = self._build_rolloff_prepend(rolloff_cond['global'], torch.rand(hr_audio.shape[0], device=self.device))
+                conditioning_inputs['prepend_cond'] = rolloff_prepend
+                conditioning_inputs['prepend_cond_mask'] = torch.ones(
+                    rolloff_prepend.shape[:2], device=self.device, dtype=torch.bool
+                )
+            conditioning_inputs['input_concat_cond'] = self._apply_latent_dropout(lr_latent, training=False)
+            t_val = torch.rand(hr_audio.shape[0], device=self.device)
+            noise_val = torch.randn_like(hr_latent)
+            z_t_val = (1 - t_val[:, None, None]) * noise_val + t_val[:, None, None] * hr_latent
+            v_target_val = hr_latent - noise_val
+            v_pred_val = self.model.model(z_t_val, t_val, **conditioning_inputs)
+            fm_loss = F.mse_loss(v_pred_val, v_target_val)
+            self.log('val/flowmatch_loss', fm_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=hr_audio.shape[0])
+            return {'val_flowmatch_loss': fm_loss}
+        
         # 使用模型生成高分辨率音频
         conditioning = self.model.conditioner(metadata, self.device)
         
@@ -445,7 +475,8 @@ class SAGASRTrainer(pl.LightningModule):
         pred_audio = self.model.pretransform.decode(pred_latent)
         
         # 低频替换（使用每个样本的低分辨率截止频率）
-        pred_audio = self._low_frequency_replace(pred_audio, lr_audio, rolloff_low)
+        if not getattr(self.hparams, "disable_val_lowfreq_replace", False):
+            pred_audio = self._low_frequency_replace(pred_audio, lr_audio, rolloff_low)
 
         # 仅保存当前epoch的首个样本
         if (
@@ -847,6 +878,10 @@ def main():
                        help='Use text captions (默认已开启)')
     parser.add_argument('--disable_caption', action='store_true',
                        help='Disable text captions (override default enablement)')
+    parser.add_argument('--val_use_flowmatch', action='store_true',
+                        help='验证阶段使用Flow Matching损失而非采样指标')
+    parser.add_argument('--disable_val_lowfreq_replace', action='store_true',
+                        help='验证阶段关闭低频替换')
     parser.add_argument('--output_dir', type=str, default='outputs',
                        help='Output directory')
     parser.add_argument('--checkpoint', type=str, default=None,
@@ -918,6 +953,8 @@ def main():
         val_save_audio_dir=args.val_save_audio_dir,
         val_save_interval=args.val_save_interval
     )
+    model.hparams.val_use_flowmatch = args.val_use_flowmatch
+    model.hparams.disable_val_lowfreq_replace = args.disable_val_lowfreq_replace
     
     # Callbacks
     checkpoint_callback = ModelCheckpoint(
