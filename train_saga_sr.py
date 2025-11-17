@@ -296,16 +296,22 @@ class SAGASRTrainer(pl.LightningModule):
 
         lr_latent_cond = self._apply_latent_dropout(lr_latent, training=True)
         
-        # Flow Matching (论文公式)
+        # Flow Matching / Rectified Flow 目标
+        # 说明：
+        # - 这里的定义与 Stable Audio 内置的 rectified_flow 保持一致：
+        #   t = 0 -> 纯数据 (hr_latent)
+        #   t = 1 -> 纯噪声 (noise)
+        # - 路径：z_t = (1 - t) * z_data + t * z_noise
+        # - 目标速度：v_target = z_noise - z_data = z_1 - z_0
         batch_size = hr_audio.shape[0]
         t = torch.rand(batch_size, device=self.device)  # [B], 均匀分布 [0,1]
         noise = torch.randn_like(hr_latent)  # [B, 64, L]
         
-        # 插值
-        z_t = (1 - t[:, None, None]) * noise + t[:, None, None] * hr_latent
+        # 插值：t=0 为数据，t=1 为噪声
+        z_t = (1 - t[:, None, None]) * hr_latent + t[:, None, None] * noise
         
-        # 目标速度
-        v_target = hr_latent - noise
+        # 目标速度：噪声 - 数据
+        v_target = noise - hr_latent
         
         # 准备metadata（Stable Audio标准格式）
         # 每个metadata字典必须包含所有conditioning keys
