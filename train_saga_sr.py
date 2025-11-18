@@ -137,6 +137,7 @@ class SAGASRTrainer(pl.LightningModule):
             print("SwanLab logging is enabled.")
 
     def _load_stable_audio_pretrained(self):
+        """加载 Stable Audio Open 1.0 预训练权重，并对因 input_concat_dim 变化导致的输入层做形状补丁。"""
         root_dir = os.path.dirname(os.path.abspath(__file__))
         model_dir = os.path.join(root_dir, "stable-audio-open-1.0")
 
@@ -153,12 +154,76 @@ class SAGASRTrainer(pl.LightningModule):
                 print(f"[SAGA-SR] Stable Audio checkpoint not found under: {model_dir}")
                 return
 
-            state_dict = load_ckpt_state_dict(ckpt_path)
-            copy_state_dict(self.model, state_dict)
-            print(f"[SAGA-SR] Loaded Stable Audio Open 1.0 pretrained weights from: {ckpt_path}")
+            print(f"[SAGA-SR] Loading weights from: {ckpt_path}")
+            # 加载预训练权重字典
+            pretrained_state_dict = load_ckpt_state_dict(ckpt_path)
+
+            # 获取当前新模型的权重字典
+            current_model_dict = self.model.state_dict()
+
+            # === 关键修复：手动 Patch 维度不匹配的输入层 ===
+            # 依据 saga_model_config.json:
+            # 原模型输入 dim_in=64, 新模型输入 dim_in=128 (64 HR + 64 LR)
+            # 涉及两个层:
+            # 1. model.model.preprocess_conv (Conv1d): [Out=128, In=128, 1] vs [64, 64, 1]
+            # 2. model.model.transformer.project_in (Linear): [Out=1536, In=128] vs [1536, 64]
+
+            # 定义需要手术的层名称
+            layers_to_patch = [
+                "model.model.preprocess_conv.weight",
+                "model.model.transformer.project_in.weight",
+            ]
+
+            for key in layers_to_patch:
+                if key in pretrained_state_dict and key in current_model_dict:
+                    pretrained_weight = pretrained_state_dict[key]
+                    current_weight = current_model_dict[key]
+
+                    # 1. 处理 Linear 层 (transformer.project_in)
+                    # PyTorch Linear 权重形状为 [Out, In]
+                    # 目标: [1536, 128], 源: [1536, 64]
+                    if key == "model.model.transformer.project_in.weight":
+                        if pretrained_weight.shape == (1536, 64) and current_weight.shape == (1536, 128):
+                            print(f"[Patching] {key}: {pretrained_weight.shape} -> {current_weight.shape}")
+                            # 复制前半部分 (HR特征)
+                            current_weight.data[:, :64] = pretrained_weight.data
+                            # 后半部分 (LR特征) 初始化为 0
+                            current_weight.data[:, 64:] = 0.0
+                            # 从待加载字典中移除，防止后续覆盖报错
+                            del pretrained_state_dict[key]
+
+                    # 2. 处理 Conv1d 层 (preprocess_conv)
+                    # PyTorch Conv1d 权重形状为 [Out, In, Kernel]
+                    # 目标: [128, 128, 1], 源: [64, 64, 1]
+                    elif key == "model.model.preprocess_conv.weight":
+                        if pretrained_weight.shape == (64, 64, 1) and current_weight.shape == (128, 128, 1):
+                            print(f"[Patching] {key}: {pretrained_weight.shape} -> {current_weight.shape}")
+                            # 这是一个残差连接前的预处理 conv(x) + x
+                            # 我们希望初始状态下，新增的通道(LR)不产生干扰，且原有通道(HR)保持原样
+
+                            # 左上角 (64x64): 复制原权重 (处理 HR -> HR)
+                            current_weight.data[:64, :64, :] = pretrained_weight.data
+
+                            # 右下角 (64x64): 处理 LR -> LR
+                            # 初始化为 0，确保初始时刻 LR 输入不产生任何额外激活
+                            current_weight.data[64:, 64:, :].zero_()
+
+                            # 非对角块 (HR->LR 和 LR->HR): 设为 0 以解耦
+                            current_weight.data[:64, 64:, :].zero_()
+                            current_weight.data[64:, :64, :].zero_()
+
+                            del pretrained_state_dict[key]
+
+            # 加载剩余所有匹配的层
+            copy_state_dict(self.model, pretrained_state_dict)
+            print(f"[SAGA-SR] Pretrained weights loaded successfully with Input Patching.")
             self._swanlab_log({"model/pretrained_loaded": 1.0}, step=0)
+
         except Exception as exc:
             print(f"[SAGA-SR] Failed to load Stable Audio pretrained weights: {exc}")
+            # 打印详细错误堆栈以便调试
+            import traceback
+            traceback.print_exc()
 
     def on_validation_epoch_start(self):
         self._val_preview = None
@@ -795,7 +860,7 @@ def main():
                        help='DataLoader workers')
     parser.add_argument('--max_steps', type=int, default=26000,
                        help='Max training steps (论文标准: 26000)')
-    parser.add_argument('--learning_rate', type=float, default=1e-5,
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
                        help='Learning rate (论文标准: 1e-5)')
     parser.add_argument('--use_caption', action='store_true',
                        help='Use text captions (默认已开启)')
