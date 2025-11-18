@@ -30,7 +30,7 @@ from dataset import SAGASRDataset
 from conditioner_rolloff import RolloffFourierConditioner, CombinedConditioner
 from audio_captioning_adapter import QwenAudioCaptioner, CaptionCache
 from metrics import compute_lsd, compute_si_sdr, evaluate_audio_quality
-from t_schedule import build_linear_quadratic_t_schedule
+from saga_sampling import sample_cfg_euler
 
 
 def saga_collate_fn(batch):
@@ -724,50 +724,23 @@ class SAGASRTrainer(pl.LightningModule):
     ) -> torch.Tensor:
         """
         使用SAGA-SR论文的多重CFG + Euler采样生成latent。
-        - 若 emulate_linear_steps 为 None: 使用简单线性 t-schedule
+        通过复用 `saga_sampling.sample_cfg_euler`，避免与推理端实现分叉。
+
+        - 若 emulate_linear_steps 为 None 或 <=0: 使用简单线性 t-schedule
         - 若 emulate_linear_steps > 0: 使用 MovieGen/SAGA-SR 引用的
-          linear-quadratic t-schedule 对 N=emulate_linear_steps 的线性schedule进行加速
+          linear-quadratic t-schedule 对 N=emulate_linear_steps 的线性 schedule 进行加速
         """
 
-        # 构建CFG模型包装器
-        sampler_wrapper = _SAGASRCFGWrapper(
+        sampled = sample_cfg_euler(
             base_model=self.model.model,
             lr_latent=lr_latent,
-            rolloff_cond=rolloff_cond,
             conditioning_inputs=conditioning_inputs,
-            s_a=guidance_scale_acoustic,
-            s_t=guidance_scale_text,
-            device=self.device,
+            rolloff_cond=rolloff_cond,
+            num_steps=num_steps,
+            guidance_scale_acoustic=guidance_scale_acoustic,
+            guidance_scale_text=guidance_scale_text,
+            emulate_linear_steps=emulate_linear_steps,
         )
-
-        noise = torch.randn_like(lr_latent)
-
-        if emulate_linear_steps is not None and emulate_linear_steps > 0:
-            # 线性-二次 t-schedule：前 S/2 步复用线性 schedule，后 S/2 步二次分布
-            t_schedule = build_linear_quadratic_t_schedule(
-                num_steps=num_steps,
-                emulate_linear_steps=emulate_linear_steps,
-                sigma_max=1.0,
-                device=lr_latent.device,
-            )
-            sampled = sample_discrete_euler(
-                model=sampler_wrapper,
-                x=noise,
-                sigmas=t_schedule,
-                sigma_max=1.0,
-                dist_shift=None,
-                disable_tqdm=True,
-            )
-        else:
-            # 退化为简单线性schedule
-            sampled = sample_discrete_euler(
-                model=sampler_wrapper,
-                x=noise,
-                steps=num_steps,
-                sigma_max=1.0,
-                dist_shift=None,
-                disable_tqdm=True,
-            )
 
         return sampled
 
@@ -801,101 +774,6 @@ class SAGASRTrainer(pl.LightningModule):
                 'frequency': 1
             }
         }
-
-
-class _SAGASRCFGWrapper:
-    """Stable Audio模型的多重CFG包装器，对齐SAGA-SR的三路条件组合。"""
-
-    def __init__(
-        self,
-        base_model,
-        lr_latent: torch.Tensor,
-        rolloff_cond: dict,
-        conditioning_inputs: dict,
-        s_a: float,
-        s_t: float,
-        device: torch.device,
-    ):
-        self.base_model = base_model
-        self.lr_latent = lr_latent
-        self.lr_latent_uncond = torch.zeros_like(lr_latent)
-        self.rolloff_cond = rolloff_cond
-        self.s_a = s_a
-        self.s_t = s_t
-        self.device = device
-        self.cross_attn_text = conditioning_inputs.get('text_cross_attn_cond')
-        self.cross_attn_full = conditioning_inputs.get('cross_attn_cond')
-        self.global_cond = conditioning_inputs.get('global_cond')
-        self.prepend_mask = conditioning_inputs.get('prepend_cond_mask')
-
-    def __call__(self, x: torch.Tensor, t: torch.Tensor, **kwargs):
-        rolloff_cross = self.rolloff_cond.get('cross_attn')
-        rolloff_global = self.rolloff_cond.get('global')
-        rolloff_prepend = None
-        prepend_mask = self.prepend_mask
-
-        if rolloff_global is not None:
-            dit = self.base_model.model if hasattr(self.base_model, "model") else self.base_model
-            timestep_embed = dit.to_timestep_embed(dit.timestep_features(t[:, None]))
-            rolloff_prepend = rolloff_global.unsqueeze(1) + timestep_embed.unsqueeze(1)
-            if (
-                prepend_mask is None
-                or prepend_mask.shape[0] != rolloff_prepend.shape[0]
-                or prepend_mask.shape[1] != rolloff_prepend.shape[1]
-            ):
-                prepend_mask = torch.ones(
-                    rolloff_prepend.shape[:2],
-                    device=rolloff_prepend.device,
-                    dtype=torch.bool,
-                )
-
-        # 1. 无条件分支：不使用 z_l 与文本，但始终保留 roll-off 条件
-        v_uncond = self.base_model(
-            x,
-            t,
-            input_concat_cond=self.lr_latent_uncond,
-            cross_attn_cond=rolloff_cross,
-            global_cond=self.global_cond,
-            prepend_cond=rolloff_prepend,
-            prepend_cond_mask=prepend_mask,
-        )
-
-        # 2. 仅声学条件（global_cond 已包含原始 + roll-off）
-        v_acoustic = self.base_model(
-            x,
-            t,
-            input_concat_cond=self.lr_latent,
-            cross_attn_cond=rolloff_cross,
-            global_cond=self.global_cond,  # 保持与训练一致
-            prepend_cond=rolloff_prepend,
-            prepend_cond_mask=prepend_mask,
-        )
-
-        # 3. 完整条件（文本 + 声学）
-        cross_attn_full = self.cross_attn_full
-        if cross_attn_full is None:
-            if self.cross_attn_text is not None and rolloff_cross is not None:
-                cross_attn_full = torch.cat(
-                    [self.cross_attn_text, rolloff_cross],
-                    dim=1,
-                )
-            else:
-                cross_attn_full = rolloff_cross
-
-        v_full = self.base_model(
-            x,
-            t,
-            input_concat_cond=self.lr_latent,
-            cross_attn_cond=cross_attn_full,
-            global_cond=self.global_cond,  # 保持与训练一致
-            prepend_cond=rolloff_prepend,
-            prepend_cond_mask=prepend_mask,
-        )
-
-        # 多重CFG合成
-        v = v_uncond + self.s_a * (v_acoustic - v_uncond) + self.s_t * (v_full - v_acoustic)
-
-        return v
 
 
 def main():
