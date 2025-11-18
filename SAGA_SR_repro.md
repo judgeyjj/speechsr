@@ -1,112 +1,315 @@
-### CoT Prompt：SAGA-SR 代码复现审查
-
-**角色：** 你现在是一位顶级的信号处理专家和资深AI架构师。你对PyTorch和主流音频生成框架（如stable-audio）了如指掌，并且善于发现代码实现与论文描述之间的细微差异。
-
-**任务：** 你的任务是严格审查一份SAGA-SR的代码实现，并根据其论文和架构图检查其复现的准确性。
-
-**请严格遵循以下的思维链（Chain-of-Thought）步骤来完成你的审查：**
-
-#### 第1步：回忆并确认 SAGA-SR 的核心架构
-
-在开始审查代码之前，我首先要明确SAGA-SR的核心技术点：
-
-1. **目标：** 实现一个通用的音频超分辨率（SR）任务，能够将任意 4 kHz 到 32 kHz 的音频上采样到 44.1 kHz。
-2. **模型骨干：** 采用了 DiT (Diffusion Transformer) 骨干。
-3. **训练目标：** 使用了流匹配（Flow Matching）目标进行训练，而非传统的 diffusion-based 目标。
-4. **核心创新（双重引导）：**
-   - **语义引导 (Semantic Guidance)：** 使用文本嵌入（Text Embeddings）。
-   - **声学引导 (Acoustic Guidance)：** 使用频谱滚降嵌入（Spectral Roll-off Embeddings）。
-5. **关键组件（如图SAGA-SR.PNG所示）：**
-   - **VAE Encoder/Decoder：** 用于将音频 $x_h, x_l$ 压缩到潜空间 $z_h, z_l$ 。
-   - **Qwen2-Audio：** 用于从音频生成文本描述（Caption）。
-   - **T5-base Encoder：** 用于将生成的文本描述编码为文本嵌入（Text Embeddings）。
-   - **DiT：** 核心的 Transformer 模块，用于在潜空间中去噪（或流匹配）。
-
-#### 第2步：对照架构图检查数据流和条件注入
-
-下一步是逐一核对代码中的数据流是否与图完全一致，特别是条件的注入方式（Concat操作）。
-
-1. **检查VAE潜变量 $z_l$ 的注入：**
-   - 论文描述：$z_l$ 与 $z_t$（带噪声的潜变量）沿着**通道维度 (channel dimension)** 进行拼接。
-   - **审查点：** 代码中是否准确执行了 `torch.cat((z_t, z_l), dim=...)`，并且这个 `dim` 确实是通道维度（通常是 `dim=1` 对于 `[B, C, T]` 格式的张量）？
-2. **检查“语义引导”的数据流：**
-   - 流程：Low-res Audio -> Qwen2-Audio -> 文本 "A rooster is crowing." -> T5-base Encoder -> 文本嵌入 。
-   - **审查点：** 代码是否正确调用了 Qwen2-Audio 和 T5-base Encoder？
-3. **检查“声学引导”的数据流（频谱滚降）：**
-   - 流程：从 $x_l$ 和 $x_h$（或目标）中提取滚降值 $f_l, f_h$ -> 分别送入 Input/Target Roll-off Embedder 。
-   - **审查点：**
-     - 滚降提取是否正确？（见第3步的详细检查）。
-     - 这两个嵌入器（Embedder）是否被正确实现（论文中提到是可学习的傅里叶嵌入）？
-4. **检查 DiT 核心条件的注入（最关键的部分）：**
-   - 论文描述了**两种**条件注入机制。我必须检查这两种机制是否都已正确实现。
-   - **机制A (Cross-Attention)：**
-     - 流程：文本嵌入（来自T5）与频谱滚降嵌入（来自Input/Target Embedder）沿着**序列维度 (sequence dimension)** 拼接。
-     - **审查点：** 代码中是否存在 `torch.cat((text_embeds, rolloff_embeds), dim=...)`，且 `dim` 是序列维度（通常是 `dim=1` 或 `dim=2`，取决于张量是 `[B, T, C]` 还是 `[B, N, T, C]`）？这个拼接后的张量是否被送入了 DiT 的 Cross-Attention 层？
-   - **机制B (Prepended Tokens / Timestep Sum)：**
-     - 流程：Input 和 Target 滚降嵌入**沿着通道维度**拼接 -> 线性投射 (Projection) -> 与 Timestep 嵌入相加-> **预置 (Prepended)** 到 DiT 的输入序列中 。
-     - **审查点：** 这是一套复杂的操作。需要仔细检查：
-     - 1) `cat(Input_roll, Target_roll, dim=channel)` ；
-       2)  `sum(Projection(...), timestep_embedding)` ；
-       3)  这个结果是否被当作 `[B, N, C]` 形式的 token，并与 DiT 的主输入序列（来自 $z_t$ 和 $z_l$）在序列维度上拼接？
-
-#### 第3D步：核查训练细节与关键参数
-
-在确认了宏观架构后，我必须深入代码细节，检查实现参数是否与论文一致。
-
-1. **模型冻结（非常重要）：**
-   - 用户提示：训练时冻结 VAE、Qwen2-Audio、T5-base，只训练 DiT。
-   - **审查点：** 我需要检查代码的训练循环设置。`vae.parameters()`、`qwen2.parameters()`、`t5.parameters()` 是否被设置了 `requires_grad=False`？`dit.parameters()` 是否是优化器 (AdamW) 唯一优化的参数？
-2. **频谱滚降的计算细节：**
-   - 论文描述：不是逐帧计算，而是对**整个幅度谱图沿时间轴求和**（sum over the time axis）来获得单个滚降值。
-   - **审查点：** 代码是否错误地使用了 `librosa.feature.spectral_rolloff` 的默认逐帧行为 ？还是正确地先计算STFT，然后 `torch.sum(mag_spec, dim=-1)`（假设-1是时间轴），再基于这个聚合的谱图计算滚降？
-   - **参数审查点：** STFT 窗口是否为 Hann 窗，大小 2048？Hop size 是否为 512？滚降百分比 (roll-off percentage) 是否设置为 0.985
-3. **Classifier-Free Guidance (CFG) 和 Dropout：**
-   - 论文描述：在 $z_l$ 上应用 10% 的 dropout；在文本嵌入上应用 10% 的 dropout。这是实现 CFG 的关键。
-   - **审查点：** 在 DiT 模型的 `forward` 方法中，是否存在对 $z_l$ 和 `text_embeddings` 的 10% dropout？
-4. **训练目标：**
-   - 论文描述：使用流匹配 (Flow Matching) 。
-   - **审查点：** Loss 是否按照公式 (3) 计算？即 $||u(...) - v_t||^2$，其中 $v_t = z_1 - z_0$ (公式2 )？代码是否正确地计算了目标速度 $v_t$？
-5. **关键超参数：**
-   - **审查点：** 优化器是否为 AdamW，$\beta_1=0.9, \beta_2=0.999$ ？Batch size 是否为 256 ？学习率是否为 $1.0 \times 10^{-5}$ ？
-
-#### 第4步：总结审查结论
-
-在完成了上述所有步骤的详细检查后：
-
-1. **总结一致性：** 明确指出代码在哪些方面（架构、数据流、关键参数）与 SAGA-SR 论文和架构图保持了高度一致。
-
-2. **报告差异点：** 重点列出所有发现的差异、遗漏或潜在的逻辑错误。特别是第2步中的 Concat 维度和第3步中的滚降计算方式，这些是最容易出错的地方。
-
-3. **提供修复建议：** 对所有发现的差异点，提供基于论文的明确修改建议。
-
----
-
-#### 审查结果（2025-11-15）
-
-**第1步：架构回顾**
-
-- 复现代码沿用 Stable Audio 的 `pretransform (VAE) → conditioner (T5) → DiT` 骨架，能够处理 4–32 kHz → 44.1 kHz 的任意带宽任务；DiT 核心通过 `create_model_from_config` 载入，整体结构与论文描述一致。模型配置中 VAE 的降采样比为 2048，匹配论文中的潜空间设定。 
-
-**第2步：数据流与条件注入**
-
-1. **VAE 潜变量拼接：** 训练与推理均将低分辨率潜变量 `lr_latent` 作为 `input_concat_cond` 传入 DiT，DiT 实现内部会沿通道维度将其与噪声潜变量 `z_t` 拼接，从而满足 “$z_l$ 与 $z_t$ 在通道维度拼接” 的要求。@train_saga_sr.py#307-315 @stable-audio-tools/stable_audio_tools/models/dit.py#160-166
-2. **语义引导链路：** 数据集优先读取同名转录，若缺失且 `use_caption=True` 则调用 Qwen2-Audio 生成 caption，再经 Stable Audio Conditioner（T5-base）编码；同时在训练中对 caption 施加 10% dropout 以配合 CFG。@train_saga_sr.py#260-585
-3. **声学引导与滚降提取：** 数据集与推理阶段均调用 `compute_spectral_rolloff`，该函数使用 Hann window、`n_fft=2048`、`hop=512` 并在时间轴求和后寻找 0.985 百分位，符合论文要求；roll-off 通过 `RolloffFourierConditioner` 映射到可学习的 Fourier 嵌入。@spectral_features.py#6-53 @dataset.py#104-113 @inference_saga_sr.py#121-143
-4. **双通道条件注入：**
-   - Cross-Attention：文本嵌入与 roll-off 嵌入在序列维度拼接后送入 DiT。@train_saga_sr.py#290-299
-   - Prepended Tokens：`rolloff_global` 经 `_build_rolloff_prepend` 与时间步嵌入相加后附加到序列前端，并同步传入掩码。@train_saga_sr.py#300-305 @train_saga_sr.py#212-225
-
-**第3步：训练细节与关键参数**
-
-1. **模块冻结：** 训练启动时显式冻结 VAE 与 Conditioner，仅保留 DiT 以及自定义 roll-off 条件器可训练，符合只训练骨干的设定。@train_saga_sr.py#130-156
-2. **Flow Matching 目标：** 代码使用 `z_t = (1-t)·noise + t·z_h`、`v_target = z_h - noise` 并以 MSE 最小化 `v_pred` 与 `v_target`，与论文的流匹配公式一致。@train_saga_sr.py#248-319
-3. **低频替换：** 推理阶段在 roll-off 以下频段用输入音频替换，保持论文的后处理策略。@inference_saga_sr.py#211-257
-4. **优化与超参：** 优化器为 AdamW（β₁=0.9、β₂=0.999）且默认学习率 1e-5，满足论文主超参数；批大小由 DataLoader 外部控制。@train_saga_sr.py#642-671
-5. **CFG Dropout 机制：**
-   - 文本条件：10% caption dropout。@train_saga_sr.py#260-266
-   - 声学条件：`RolloffFourierConditioner` 以 10% 概率同时丢弃 cross/global 嵌入，起到无条件分支作用。@conditioner_rolloff.py#81-87
-   - 低分辨率latent：新增 `_apply_latent_dropout`，训练阶段以 10% 概率对 `lr_latent` 做掩蔽，同时 CFG 采样器的无条件分支使用零 latent，形成与论文一致的三路 CFG。@train_saga_sr.py#115-753
-
-**差异与修复建议**
-
-当前 CFG 路线（文本 / roll-off / latent）均已按论文实现，数据集已提供可靠转录文本，因此无需额外 caption。暂未发现新的差异项，可直接进入训练与验证环节。
+Versatile audio super-resolution (SR) aims to predict high-
+frequency components from low-resolution audio across di-
+verse domains such as speech, music, and sound effects. Ex-
+isting diffusion-based SR methods often fail to produce se-
+mantically aligned outputs and struggle with consistent high-
+frequency reconstruction. In this paper, we propose SAGA-
+SR, a versatile audio SR model that combines semantic and
+acoustic guidance. Based on a DiT backbone trained with
+a flow matching objective, SAGA-SR is conditioned on text
+and spectral roll-off embeddings. Due to the effective guid-
+ance provided by its conditioning, SAGA-SR robustly upsam-
+ples audio from arbitrary input sampling rates between 4 kHz
+and 32 kHz to 44.1 kHz. Both objective and subjective eval-
+uations show that SAGA-SR achieves state-of-the-art perfor-
+mance across all test cases. Sound examples and code for the
+proposed model are available online1
+.
+Index Terms— audio super-resolution, bandwidth exten-
+sion, flow matching, generative model
+1. INTRODUCTION
+Audio super-resolution (SR) aims to reconstruct a high-
+resolution audio signal from its corresponding low-resolution
+audio signal. To enhance listening experiences, it can be ap-
+plied to diverse audio types, including historical recordings,
+low-bandwidth telephone audio, and audio generated by deep
+learning models [1]. Previous audio SR methods [2, 3] based
+on deep neural networks have achieved promising perfor-
+mance in constrained settings, including fixed upsampling
+ratios and restricted domains such as speech or music. How-
+ever, these constraints limit their applicability in diverse and
+complex real-world scenarios.
+To address this issue, several recent works [1, 4] have fo-
+cused on versatile audio super-resolution, which is the task of
+upsampling general-domain audio, including music, speech,
+and sound effects, from varying input sampling rates to full
+bandwidth, such as 44.1 kHz or 48 kHz. AudioSR [1] em-
+ploys a latent diffusion model (LDM) [5] with a Transformer-
+UNet backbone [6] to capture the complex distributions of
+general audio signals. FlashSR [4] employs diffusion distil-
+lation [7] to train the Student LDM using AudioSR as the
+Teacher LDM and proposes the SR Vocoder to further en-
+hance AudioSR’s performance.
+Although previous methods have achieved notable suc-
+cess, there is still room for improvement. There are two key
+challenges hindering the performance of versatile audio SR
+models. First, to generate natural high-resolution audio, an
+audio SR model needs to capture semantic information from
+low-resolution input and effectively incorporate it into the
+reconstruction process. Previous methods often fail to predict
+semantically-aligned high-frequency components, resulting
+in unnatural artifacts, such as excessive sibilance [4]. Second,
+unlike speech SR, versatile audio SR handles a much broader
+range of audio domains, which exhibit high diversity in high-
+frequency energy distributions. This results in difficulties for
+models in consistently reconstructing high-frequency content,
+especially when the input has a low cutoff-frequency (e.g., 4
+kHz).
+In this paper, we present SAGA-SR, a versatile audio
+super-resolution model that leverages semantic and acous-
+tic conditions. SAGA-SR is based on a DiT [8] backbone
+trained with a flow matching objective [9], incorporating
+two key conditions. First, inspired by recent works [10, 11]
+in the computer vision domain, we utilize text embeddings
+for semantic guidance. Specifically, we employ an audio-
+language model to generate text captions from audio, en-
+abling more efficient training and inference. Second, we
+introduce spectral roll-off embeddings, which provide rela-
+tive high-frequency energy information for both the input and
+target audio. Guided by both semantic and acoustic condi-
+tions, SAGA-SR can robustly upsample music, speech, and
+sound effects from any sampling rate between 4 kHz and 32
+kHz to 44.1 kHz, and achieves state-of-the-art performance
+on both objective and subjective evaluations.
+This work was supported by the National Research Foundation of Ko-
+rea (NRF) grant funded by the Korea government (MSIT) (No. RS-2023-
+00222383).
+1http://jakeoneijk.github.io/saga-sr-project
+2. METHOD
+Figure 1 shows the overall architecture of SAGA-SR. Let xh,
+xl ∈R2×L represent the high-resolution and low-resolution
+audio, respectively, where Lis the number of samples. Each
+audio sample is compressed into latent representations zh ∈
+R64×L/2048 and zl ∈R64×L/2048 by the pre-trained VAE en-
+coder from [12]. The text c describes the audio content in-
+Fig. 1. Overview of SAGA-SR
+dependent of its resolution. Roll-off frequencies fh, fl ∈R
+are extracted from xh and xl, respectively. DiT estimates zh
+from zl, c, fh, and fl. The predicted latent is then converted
+into an audio signal by the pre-trained VAE decoder, followed
+by low-frequency replacement post-processing [1] to ensure
+consistency in low-frequency information. In Section 2.1, we
+present the training and inference procedures of DiT. In Sec-
+tion 2.2, we describe how each condition is processed to be
+incorporated into DiT.
+2.1. DiT Model
+Unlike previous works [1, 4] that employ a Transformer-UNet
+architecture, we use DiT [8], which is widely adopted in im-
+age and audio generation models. We adapt the DiT archi-
+tecture proposed in [12] and train it using the conditional
+flow matching objective [9]. The flow matching objective re-
+gresses onto a target vector field that generates a probability
+path, transforming a simple distribution into an approxima-
+tion of the data distribution. We use a linear interpolation
+path between the noise and the data as follows:
+zt = (1−t)·z0 + t·z1, (1)
+where z1 = zh, z0 ∼N(0,1), and t ∈[0,1]. The corre-
+sponding velocity at zt is given by
+dzt
+vt =
+dt= z1−z0. (2)
+The training objective for DiT is defined as
+Et,z0 ,z1 ,zl ,c∥u(zt,zl,c,fh,fl,t; θ)−vt∥2
+, (3)
+where θdenotes the model parameters. To condition DiT on
+zl, we concatenate zl with zt along the channel dimension. A
+dropout rate of 10% is applied to zl, enabling classifier-free
+guidance [13].
+At inference, we sample z0 ∼N(0,1) and use an ODE
+solver to generateˆ
+zh. In practice, we adopt the Euler sam-
+pler with a linear-quadratic t-schedule [14] and 100 inference
+steps. To control the influence of zl and c, we adopt the
+classifier-free guidance method introduced in [15].
+uCFG(zt,zl,c,fh,fl,t; θ) = u(zt,∅,∅,fh,fl,t; θ)
++ sa(u(zt,zl,∅,fh,fl,t; θ)−u(zt,∅,∅,fh,fl,t; θ))
++ st(u(zt,zl,c,fh,fl,t; θ)−u(zt,zl,∅,fh,fl,t; θ)),
+(4)
+where sa and st are guidance scales, and ∅ denotes null con-
+ditioning. We empirically set sa = 1.4 and st = 1.2.
+2.2. Conditioning
+Text embedding. Audio super-resolution models are typ-
+ically trained with high-resolution audio-only data, since
+low-resolution audio can be simulated from it. Compared
+to audio-only data, audio-text data is expensive to curate
+at scale. Furthermore, relying on user-provided text during
+inference can limit practical applicability and potentially de-
+grade generation quality. To address these issues, we employ
+Qwen2-Audio [16] to generate text captions from audio. Dur-
+ing training, captions generated from high-resolution audio
+are used for efficiency, while at inference, they are derived
+from low-resolution audio. Text embeddings are extracted
+from the generated captions using a pretrained T5-base en-
+coder [17] and provided to the DiT through cross-attention.
+A dropout rate of 10% is applied to the text embeddings.
+Spectral roll-off embedding. We compute the roll-off fre-
+quency from the STFT spectrogram using an open-source
+method2. Instead of computing it frame-wise as in the orig-
+inal implementation, we sum over the time axis of the mag-
+nitude spectrogram to obtain a single roll-off frequency value
+for each audio sample, which is then normalized to [0,1)
+using the min–max normalization. The normalized roll-off
+frequency value is projected into learnable Fourier embed-
+dings. We extract the spectral roll-off embeddings from both
+low-resolution and high-resolution audio.
+The spectral roll-off embeddings are conditioned into the
+DiT through two mechanisms. First, they are concatenated
+with the text embeddings along the sequence dimension be-
+fore cross-attention. Second, the input and target roll-off em-
+beddings are concatenated along the channel dimension, pro-
+jected by linear layers, summed with the timestep sinusoidal
+embeddings [18], and then prepended to the input of DiT. The
+input roll-off embeddings provide the DiT with information
+about the cutoff frequency of the input audio, improving its
+2https://librosa.org/doc/0.11.0/generated/
+librosa.feature.spectral_rolloff.html
+ability to handle varying input sampling rates, while the tar-
+get roll-off embeddings guide the amount of high-frequency
+energy to generate. During inference, the target normalized
+roll-off frequency serves as conditioning, enabling the user to
+control the high-frequency energy in the generated audio. Be-
+cause it is represented as a single scalar in [0,1), it is straight-
+forward to manipulate.
+3. EXPERIMENTS
+3.1. Training Dataset and Preprocessing
+Our training dataset configuration and data simulation method
+are consistent with previous works [1, 4]. We train on the
+FreeSound [19]3, MedleyDB [20], MUSDB18-HQ [21], Moi-
+sesDB [22], and OpenSLR4 speech dataset [23], with a total
+audio duration of around 3,800 hours. All audio was resam-
+pled to 44.1 kHz and randomly segmented into 5.94-second
+clips for training. To simulate low-high resolution audio pairs,
+we apply low-pass filtering to the high-resolution audio. The
+cutoff frequency is uniformly sampled between 2 kHz and
+16 kHz. The low-pass filter type is randomly selected from
+Chebyshev, Butterworth, Bessel, and Elliptic, with the filter
+order chosen between 2 and 10.
+3.2. Implementation Details
+The DiT was trained for 26,000 steps using the AdamW opti-
+mizer with β1 = 0.9 and β2 = 0.999. We use a batch size of
+256 and a learning rate of 1.0 ×10−5. An InverseLR sched-
+uler [12] is applied with an inverse gamma of 106, a power
+of 0.5, and a warmup factor of 0.99. To compute the roll-
+off frequency, we extract the STFT spectrogram using a Hann
+window of 2048 and a hop size of 512. The roll-off percent-
+age is set to 0.985.
+3.3. Evaluation
+Comparison. We compare SAGA-SR against state-of-the-art
+models, AudioSR [1] and FlashSR [4]. The official imple-
+mentations and checkpoints are used for all comparison mod-
+els. In addition, we conducted an ablation study to evaluate
+the effectiveness of the text embedding and the spectral roll-
+off embedding. We train two SAGA-SR variants, one without
+the text embedding and another without the spectral roll-off
+embedding. Both models are trained under the same settings
+as SAGA-SR.
+Dataset. For both objective and subjective evaluations, we
+adopt the VCTK test set (speech) [24], FMA-small (music)
+[25], and ESC50 fold-5 (sound effects) [26]. We selected 400
+samples from each dataset.
+Evaluation Metrics. For objective evaluation, each sound
+category is evaluated at cutoff frequencies of 4 kHz and 8
+3https://labs.freesound.org/
+4https://openslr.org/
+kHz. Log-Spectral Distance (LSD) is used as the evaluation
+metric, following previous studies [1, 4, 24]. Although the
+LSD metric is widely used in audio super-resolution tasks, it
+has been found that it does not always align with perceptual
+quality [1, 4]. To complement LSD, we also adopt the Fr´ echet
+Distance (FD) based on OpenL3 [27] for evaluating the music
+and sound effects categories. FD compares the statistics of
+embeddings from generated audio with those from ground-
+truth audio.
+For subjective evaluation, a listening test was conducted
+with 25 participants. For all sound categories, the cutoff fre-
+quency was set to 4 kHz. During the test, participants were
+provided with the low-resolution input audio as a low anchor
+and asked to rate the perceptual quality of the outputs from
+each model on a scale from 1 to 5. We evaluated AudioSR,
+FlashSR, and the proposed SAGA-SR.
+4. RESULTS
+4.1. Objective Evaluation
+Table 1 shows the results of the objective evaluation. SAGA-
+SR achieves state-of-the-art performance across all metrics
+and test cases, demonstrating the effectiveness of the pro-
+posed method. Compared to its variant without the spectral
+roll-off embedding, SAGA-SR consistently achieves better
+performance across all metrics and test cases. This indicates
+that the spectral roll-off embedding enhances the model’s
+ability to handle varying cutoff frequencies and guides it
+to generate outputs with the desired high-frequency energy.
+When compared with its variant without the text embedding,
+SAGA-SR achieves superior performance in the speech SR
+task. In the music and sound effect SR tasks, SAGA-SR
+and its variant achieve comparable performance in terms of
+LSD. On the other hand, SAGA-SR consistently outperforms
+its variant in FD. These results demonstrate that, while the
+spectral roll-off embedding improves spectral alignment with
+ground-truth audio, the text embedding is essential for gener-
+ating outputs that are more plausible and perceptually aligned
+with the reference audio.
+4.2. Subjective Evaluation
+Table 2 presents the results of the subjective evaluation.
+SAGA-SR achieves the highest scores across all test cases.
+Figure 2 shows a comparison of the STFT spectrograms for
+audio generated by different models. We found that AudioSR
+and FlashSR exhibit high variance in their outputs and often
+produce audio lacking sufficient high-frequency content. In
+contrast, SAGA-SR demonstrates better consistency in re-
+constructing high-frequency components, due to the explicit
+guidance provided by the spectral roll-off embedding. More-
+over, we observed that AudioSR and FlashSR often generate
+audio that is not semantically aligned with the low-resolution
+input audio. Specifically, AudioSR tends to produce outputs
+Table 1. Objective evaluation results. Bold numbers indicate the best performance, while underlined numbers denote the
+second-best performance across all models. Note that low-frequency replacement post-processing was applied to the audio
+reconstructed by the VAE.
+Speech Music Sound Effect
+Method 4kHz 8kHz LSD ↓ LSD ↓ 4kHz 8kHz LSD ↓ FD ↓ LSD ↓ FD ↓ 4kHz 8kHz
+LSD ↓ FD ↓ LSD ↓ FD ↓
+Unprocessed VAE (recon) 2.89 2.49 0.87 0.81 3.68 138.09 2.68 106.46 1.13 18.92 1.06 17.30 3.30 110.25 2.39 64.08
+1.13 13.47 1.08 11.53
+AudioSR [1] FlashSR [4] 1.46 1.26 1.47 1.15 2.09 32.52 1.88 25.93 1.76 37.79 1.69 32.08 1.85 39.69 1.68 28.54
+1.81 41.32 1.89 36.13
+SAGA-SR w/o text w/o roll-off 1.28 1.07 1.32 1.11 1.64 23.87 1.45 20.44 1.65 26.32 1.43 21.86
+1.63 30.14 1.45 25.34 1.60 29.00 1.43 23.94
+1.57 1.43 2.16 35.99 1.78 23.5 2.19 33.07 1.75 22.4
+Fig. 2. Spectrogram of compared models.
+Table 2. Subjective evaluation results.
+Method Speech Music Sound Effect
+Unprocessed Ground Truth 1.81 4.23 1.66 3.93 1.77
+4.18
+AudioSR [1] FlashSR [4] SAGA-SR 3.26 3.45 3.70 2.94 3.46 3.65 3.03
+3.34
+3.88
+5. CONCLUSIONS
+Fig. 3. Generated samples with varying scales of the target
+normalized roll-off frequency
+with excessive sibilance, while FlashSR often fails to gener-
+ate detailed harmonic structures, as illustrated in Figure 2. By
+incorporating text embeddings, SAGA-SR is able to generate
+semantically aligned audio with realistic harmonic detail.
+As shown in Figure 3, SAGA-SR allows the user to con-
+trol the high-frequency energy of the generated audio by ad-
+justing the target normalized roll-off frequency, a single scalar
+condition. This control not only reduces the variance in per-
+ceptual quality but also influences acoustic properties such as
+timbre.
+We propose SAGA-SR, a versatile audio super-resolution
+model that integrates semantic and acoustic conditioning
+into a DiT backbone trained with a flow matching objective.
+Text embeddings improve semantic alignment, while spectral
+roll-off embeddings enhance robustness and controllability
+in high-frequency reconstruction. Both objective and subjec-
+tive evaluations show that SAGA-SR outperforms previous
+methods across all tasks and metrics.
+Despite its effectiveness, SAGA-SR has limitations that
+warrant future work. First, upsampling audio with multiple
+overlapping sources remains challenging. Future work could
+scale data and model capacity or develop improved caption-
+ing methods to accurately describe all sound sources. Sec-
+ond, low-frequency replacement post-processing may intro-
+duce unnatural connections between high and low frequency
+components. A potential direction is to develop a VAE con-
+ditioned on the low-resolution waveform to achieve smoother
+integration
