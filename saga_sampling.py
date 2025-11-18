@@ -7,6 +7,7 @@ from typing import Dict, Optional
 import torch
 
 from stable_audio_tools.inference.sampling import sample_discrete_euler
+from t_schedule import build_linear_quadratic_t_schedule
 
 
 @dataclass
@@ -60,8 +61,6 @@ class SAGASRCFGWrapper:
                     device=rolloff_prepend.device,
                     dtype=torch.bool,
                 )
-        
-        # 1. 无条件分支：不使用 z_l 与文本，但始终保留 roll-off 条件
         v_uncond = self.base_model(
             x,
             t,
@@ -71,8 +70,6 @@ class SAGASRCFGWrapper:
             prepend_cond=rolloff_prepend,
             prepend_cond_mask=prepend_mask,
         )
-        
-        # 2. 声学分支：添加 z_l，但无文本
         v_acoustic = self.base_model(
             x,
             t,
@@ -82,8 +79,6 @@ class SAGASRCFGWrapper:
             prepend_cond=rolloff_prepend,
             prepend_cond_mask=prepend_mask,
         )
-
-        # 3. 完整条件（文本 + roll-off）
         if cross_attn_full is None:
             if cross_attn_text is not None and rolloff_cross is not None:
                 cross_attn_full = torch.cat([cross_attn_text, rolloff_cross], dim=1)
@@ -115,8 +110,14 @@ def sample_cfg_euler(
     num_steps: int,
     guidance_scale_acoustic: float,
     guidance_scale_text: float,
+    emulate_linear_steps: Optional[int] = 250,
 ) -> torch.Tensor:
-    """按 SAGA-SR 论文流程执行 Euler 采样。"""
+    """
+    按 SAGA-SR 论文流程执行 Euler 采样。
+    默认使用 linear-quadratic t-schedule (参考 MovieGen)，
+    emulate_linear_steps 控制近似的线性步数 N（默认 250）。
+    若将 emulate_linear_steps 设为 None 或 <=0，则退化为简单线性 schedule。
+    """
 
     bundle = ConditioningBundle(
         lr_latent=lr_latent,
@@ -136,13 +137,31 @@ def sample_cfg_euler(
 
     noise = torch.randn_like(lr_latent)
 
-    sampled = sample_discrete_euler(
-        model=cfg_wrapper,
-        x=noise,
-        steps=num_steps,
-        sigma_max=1.0,
-        dist_shift=None,
-        disable_tqdm=True,
-    )
+    if emulate_linear_steps is not None and emulate_linear_steps > 0:
+        # 使用 linear-quadratic t-schedule 做加速推理
+        t_schedule = build_linear_quadratic_t_schedule(
+            num_steps=num_steps,
+            emulate_linear_steps=emulate_linear_steps,
+            sigma_max=1.0,
+            device=lr_latent.device,
+        )
+        sampled = sample_discrete_euler(
+            model=cfg_wrapper,
+            x=noise,
+            sigmas=t_schedule,
+            sigma_max=1.0,
+            dist_shift=None,
+            disable_tqdm=True,
+        )
+    else:
+        # 退化为简单线性 schedule
+        sampled = sample_discrete_euler(
+            model=cfg_wrapper,
+            x=noise,
+            steps=num_steps,
+            sigma_max=1.0,
+            dist_shift=None,
+            disable_tqdm=True,
+        )
 
     return sampled

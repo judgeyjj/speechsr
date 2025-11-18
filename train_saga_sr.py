@@ -30,6 +30,7 @@ from dataset import SAGASRDataset
 from conditioner_rolloff import RolloffFourierConditioner, CombinedConditioner
 from audio_captioning_adapter import QwenAudioCaptioner, CaptionCache
 from metrics import compute_lsd, compute_si_sdr, evaluate_audio_quality
+from t_schedule import build_linear_quadratic_t_schedule
 
 
 def saga_collate_fn(batch):
@@ -491,6 +492,7 @@ class SAGASRTrainer(pl.LightningModule):
             num_steps=getattr(self.hparams, "val_num_steps", 100),
             guidance_scale_acoustic=1.4,
             guidance_scale_text=1.2,
+            emulate_linear_steps=getattr(self.hparams, "val_emulate_linear_steps", 250),
         )
         
         # 解码为音频
@@ -718,8 +720,14 @@ class SAGASRTrainer(pl.LightningModule):
         num_steps: int,
         guidance_scale_acoustic: float,
         guidance_scale_text: float,
+        emulate_linear_steps: int | None = None,
     ) -> torch.Tensor:
-        """使用SAGA-SR论文的多重CFG + Euler采样生成latent。"""
+        """
+        使用SAGA-SR论文的多重CFG + Euler采样生成latent。
+        - 若 emulate_linear_steps 为 None: 使用简单线性 t-schedule
+        - 若 emulate_linear_steps > 0: 使用 MovieGen/SAGA-SR 引用的
+          linear-quadratic t-schedule 对 N=emulate_linear_steps 的线性schedule进行加速
+        """
 
         # 构建CFG模型包装器
         sampler_wrapper = _SAGASRCFGWrapper(
@@ -734,14 +742,32 @@ class SAGASRTrainer(pl.LightningModule):
 
         noise = torch.randn_like(lr_latent)
 
-        sampled = sample_discrete_euler(
-            model=sampler_wrapper,
-            x=noise,
-            steps=num_steps,
-            sigma_max=1.0,
-            dist_shift=None,
-            disable_tqdm=True,
-        )
+        if emulate_linear_steps is not None and emulate_linear_steps > 0:
+            # 线性-二次 t-schedule：前 S/2 步复用线性 schedule，后 S/2 步二次分布
+            t_schedule = build_linear_quadratic_t_schedule(
+                num_steps=num_steps,
+                emulate_linear_steps=emulate_linear_steps,
+                sigma_max=1.0,
+                device=lr_latent.device,
+            )
+            sampled = sample_discrete_euler(
+                model=sampler_wrapper,
+                x=noise,
+                sigmas=t_schedule,
+                sigma_max=1.0,
+                dist_shift=None,
+                disable_tqdm=True,
+            )
+        else:
+            # 退化为简单线性schedule
+            sampled = sample_discrete_euler(
+                model=sampler_wrapper,
+                x=noise,
+                steps=num_steps,
+                sigma_max=1.0,
+                dist_shift=None,
+                disable_tqdm=True,
+            )
 
         return sampled
 
@@ -797,11 +823,8 @@ class _SAGASRCFGWrapper:
         self.s_a = s_a
         self.s_t = s_t
         self.device = device
-
-        # 提前准备文本条件与完整 cross-attn，避免在采样时重复拼接
         self.cross_attn_text = conditioning_inputs.get('text_cross_attn_cond')
         self.cross_attn_full = conditioning_inputs.get('cross_attn_cond')
-        # global_cond 已经是 (原始 + roll-off) 的组合，保持一致性
         self.global_cond = conditioning_inputs.get('global_cond')
         self.prepend_mask = conditioning_inputs.get('prepend_cond_mask')
 
@@ -908,6 +931,12 @@ def main():
                        help='Output directory')
     parser.add_argument('--val_num_steps', type=int, default=100,
                        help='Validation sampling steps (默认与论文一致为 100，可在调试时调小以加快验证)')
+    parser.add_argument(
+        '--val_emulate_linear_steps',
+        type=int,
+        default=250,
+        help='Linear-Quadratic t-schedule 所近似的线性步数 N (参考 MovieGen, 默认 250)',
+    )
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Resume from checkpoint')
     parser.add_argument('--val_save_audio_dir', type=str, default=None,
@@ -987,6 +1016,7 @@ def main():
     model.hparams.val_use_flowmatch = args.val_use_flowmatch
     model.hparams.disable_val_lowfreq_replace = args.disable_val_lowfreq_replace
     model.hparams.val_num_steps = args.val_num_steps
+    model.hparams.val_emulate_linear_steps = args.val_emulate_linear_steps
     
     # Callbacks
     checkpoint_callback = ModelCheckpoint(
