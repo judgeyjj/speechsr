@@ -8,10 +8,8 @@ class RolloffFourierConditioner(nn.Module):
     """
     Roll-off双通道条件注入器
     
-    论文标准:
     - 通道1: Fourier嵌入 -> 拼接到Cross-Attention
     - 通道2: Fourier嵌入 -> 与时间步相加 -> Prepend到DiT输入
-    - Dropout: 10% (用于CFG训练)
     
     继承方式: 独立实现，不修改Stable Audio源码
     """
@@ -19,14 +17,14 @@ class RolloffFourierConditioner(nn.Module):
     def __init__(self, 
                  embedding_dim_cross=768,  # Cross-Attention嵌入维度
                  embedding_dim_global=1536,  # Global嵌入维度（匹配DiT）
-                 dropout_rate=0.1,  # 论文标准
+                 dropout_rate=0.1,
                  min_freq=0.0,
                  max_freq=22050.0):
         """
         Args:
             embedding_dim_cross: Cross-Attention通道嵌入维度
             embedding_dim_global: Global通道嵌入维度（需匹配DiT的global_cond_dim）
-            dropout_rate: Dropout概率（论文标准：0.1）
+            dropout_rate: Dropout概率（保留接口，当前实现不对roll-off做dropout）
             min_freq: Roll-off归一化最小值
             max_freq: Roll-off归一化最大值
         """
@@ -78,13 +76,7 @@ class RolloffFourierConditioner(nn.Module):
                 'cross_attn': Cross-Attention嵌入 [B, 1, D_cross] or None
                 'global': Global嵌入 [B, D_global] or None
         """
-        # Dropout判断（用于Classifier-Free Guidance）
-        if apply_dropout and self.training and random.random() < self.dropout_rate:
-            return {
-                'cross_attn': None,
-                'global': None
-            }
-        
+        # 目前不对 roll-off 条件做 dropout，始终提供 fh, fl
         # 确保输入是张量
         if not isinstance(rolloff_low, torch.Tensor):
             rolloff_low = torch.tensor([rolloff_low], dtype=torch.float32)

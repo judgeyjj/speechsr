@@ -416,6 +416,7 @@ class SAGASRTrainer(pl.LightningModule):
                 m['padding_mask'] = torch.zeros(hr_audio.shape[-1], dtype=torch.bool)
         
         if getattr(self.hparams, "val_use_flowmatch", False):
+            # 按训练同方向的 Flow Matching / Rectified Flow 目标验证
             conditioning = self.model.conditioner(metadata, self.device)
             rolloff_low = torch.stack([m['rolloff_low'] for m in metadata])
             rolloff_high = torch.stack([m['rolloff_high'] for m in metadata])
@@ -430,19 +431,32 @@ class SAGASRTrainer(pl.LightningModule):
                 else:
                     conditioning_inputs['cross_attn_cond'] = rolloff_cond['cross_attn']
             if rolloff_cond['global'] is not None:
-                rolloff_prepend = self._build_rolloff_prepend(rolloff_cond['global'], torch.rand(hr_audio.shape[0], device=self.device))
+                rolloff_prepend = self._build_rolloff_prepend(
+                    rolloff_cond['global'],
+                    torch.rand(hr_audio.shape[0], device=self.device),
+                )
                 conditioning_inputs['prepend_cond'] = rolloff_prepend
                 conditioning_inputs['prepend_cond_mask'] = torch.ones(
                     rolloff_prepend.shape[:2], device=self.device, dtype=torch.bool
                 )
-            conditioning_inputs['input_concat_cond'] = self._apply_latent_dropout(lr_latent, training=False)
+            conditioning_inputs['input_concat_cond'] = self._apply_latent_dropout(
+                lr_latent, training=False
+            )
             t_val = torch.rand(hr_audio.shape[0], device=self.device)
             noise_val = torch.randn_like(hr_latent)
-            z_t_val = (1 - t_val[:, None, None]) * noise_val + t_val[:, None, None] * hr_latent
-            v_target_val = hr_latent - noise_val
+            # 与训练一致：t=0 数据, t=1 噪声
+            z_t_val = (1 - t_val[:, None, None]) * hr_latent + t_val[:, None, None] * noise_val
+            v_target_val = noise_val - hr_latent
             v_pred_val = self.model.model(z_t_val, t_val, **conditioning_inputs)
             fm_loss = F.mse_loss(v_pred_val, v_target_val)
-            self.log('val/flowmatch_loss', fm_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=hr_audio.shape[0])
+            self.log(
+                'val/flowmatch_loss',
+                fm_loss,
+                prog_bar=True,
+                on_step=False,
+                on_epoch=True,
+                batch_size=hr_audio.shape[0],
+            )
             return {'val_flowmatch_loss': fm_loss}
         
         # 使用模型生成高分辨率音频
@@ -812,15 +826,15 @@ class _SAGASRCFGWrapper:
                     dtype=torch.bool,
                 )
 
-        # 1. 无条件（drop out cross/global，只保留lr_latent）
+        # 1. 无条件分支：不使用 z_l 与文本，但始终保留 roll-off 条件
         v_uncond = self.base_model(
             x,
             t,
             input_concat_cond=self.lr_latent_uncond,
-            cross_attn_cond=None,
-            global_cond=None,
-            prepend_cond=None,
-            prepend_cond_mask=None,
+            cross_attn_cond=rolloff_cross,
+            global_cond=self.global_cond,
+            prepend_cond=rolloff_prepend,
+            prepend_cond_mask=prepend_mask,
         )
 
         # 2. 仅声学条件（global_cond 已包含原始 + roll-off）

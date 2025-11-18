@@ -5,11 +5,17 @@
 - LSD (Log-Spectral Distance): 对数频谱距离
 - SI-SDR (Scale-Invariant Signal-to-Distortion Ratio): 尺度不变信噪比
 - PESQ (Perceptual Evaluation of Speech Quality): 可选
+- OpenL3-FD: 基于 OpenL3 的 Frechet Distance（可选）
 """
 
 import torch
 import torch.nn.functional as F
 import numpy as np
+
+try:
+    import openl3  # type: ignore
+except ImportError:
+    openl3 = None
 
 
 def compute_lsd(pred_audio, target_audio, sr=44100, n_fft=2048, hop_length=512, eps=1e-8):
@@ -225,6 +231,72 @@ def evaluate_audio_quality(pred_audio, target_audio, sr=44100):
         metrics['mse'] = float('nan')
     
     return metrics
+
+
+def extract_openl3_embedding(audio: torch.Tensor, sr: int = 44100) -> np.ndarray:
+    """
+    使用 OpenL3 提取单条音频的嵌入（时间维平均）。
+    
+    Args:
+        audio: [T] 或 [C, T] 的张量
+        sr: 采样率
+    Returns:
+        embedding: [D] 的 numpy 向量
+    """
+    if openl3 is None:
+        raise ImportError("openl3 is not installed. Please install it to compute OpenL3-FD.")
+
+    if audio.dim() == 2:
+        # [C, T] -> mono
+        audio_np = audio.mean(dim=0).cpu().numpy()
+    else:
+        audio_np = audio.cpu().numpy()
+
+    # OpenL3 期望 shape [T] 或 [T, C]，这里用 mono [T]
+    emb, _ = openl3.get_audio_embedding(
+        audio_np,
+        sr,
+        input_repr="mel128",
+        content_type="music",
+        embedding_size=512,
+    )
+    # 对时间维度取平均，得到 [D]
+    emb_mean = emb.mean(axis=0)
+    return emb_mean.astype(np.float32)
+
+
+def compute_frechet_distance(mu1: np.ndarray, sigma1: np.ndarray,
+                             mu2: np.ndarray, sigma2: np.ndarray) -> float:
+    """
+    计算两个高斯分布 N(mu1, sigma1)、N(mu2, sigma2) 的 Frechet Distance。
+    """
+    diff = mu1 - mu2
+    # 为稳健性，使用 np.linalg.sqrtm，并处理数值小的虚部
+    covmean, _ = np.linalg.linalg.sqrtm(sigma1 @ sigma2, disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    tr_covmean = np.trace(covmean)
+    fd = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
+    return float(fd)
+
+
+def compute_openl3_fd(pred_embeddings: np.ndarray, target_embeddings: np.ndarray) -> float:
+    """
+    基于 OpenL3 嵌入计算 Frechet Distance。
+    
+    Args:
+        pred_embeddings: [N, D] 预测音频嵌入
+        target_embeddings: [N, D] 参考音频嵌入
+    """
+    if pred_embeddings.shape != target_embeddings.shape:
+        raise ValueError(f"Embedding shape mismatch: pred {pred_embeddings.shape} vs target {target_embeddings.shape}")
+
+    mu_pred = pred_embeddings.mean(axis=0)
+    mu_target = target_embeddings.mean(axis=0)
+    sigma_pred = np.cov(pred_embeddings, rowvar=False)
+    sigma_target = np.cov(target_embeddings, rowvar=False)
+
+    return compute_frechet_distance(mu_pred, sigma_pred, mu_target, sigma_target)
 
 
 # 测试代码

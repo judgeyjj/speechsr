@@ -37,6 +37,7 @@ class SAGASRCFGWrapper:
         self.guidance_scale_text = guidance_scale_text
 
     def __call__(self, x: torch.Tensor, t: torch.Tensor, **kwargs) -> torch.Tensor:
+        # 条件缓存
         lr_latent = self.bundle.lr_latent
         rolloff_cross = self.bundle.rolloff_cond.get("cross_attn")
         rolloff_global = self.bundle.rolloff_cond.get("global")
@@ -59,19 +60,19 @@ class SAGASRCFGWrapper:
                     device=rolloff_prepend.device,
                     dtype=torch.bool,
                 )
-
-        # 1. 无条件分支
+        
+        # 1. 无条件分支：不使用 z_l 与文本，但始终保留 roll-off 条件
         v_uncond = self.base_model(
             x,
             t,
-            input_concat_cond=lr_latent,
-            cross_attn_cond=None,
-            global_cond=None,
-            prepend_cond=None,
-            prepend_cond_mask=None,
+            input_concat_cond=torch.zeros_like(lr_latent),
+            cross_attn_cond=rolloff_cross,
+            global_cond=self.bundle.global_cond,
+            prepend_cond=rolloff_prepend,
+            prepend_cond_mask=prepend_mask,
         )
-
-        # 2. 声学分支（仅 roll-off）
+        
+        # 2. 声学分支：添加 z_l，但无文本
         v_acoustic = self.base_model(
             x,
             t,

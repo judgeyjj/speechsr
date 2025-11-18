@@ -19,7 +19,13 @@ import torch
 import scipy.signal as signal
 
 from inference_saga_sr import SAGASRInference
-from metrics import evaluate_audio_quality, compute_lsd, compute_si_sdr
+from metrics import (
+    evaluate_audio_quality,
+    compute_lsd,
+    compute_si_sdr,
+    extract_openl3_embedding,
+    compute_openl3_fd,
+)
 
 
 class SAGASREvaluator:
@@ -101,7 +107,8 @@ class SAGASREvaluator:
                         num_samples=None,
                         save_audio=True,
                         target_rolloff=16000.0,
-                        num_steps=100):
+                        num_steps=100,
+                        enable_openl3_fd=False):
         """
         评估整个测试集
         
@@ -143,6 +150,9 @@ class SAGASREvaluator:
             'files': [],
             'summary': {}
         }
+
+        pred_embeds = []
+        target_embeds = []
         
         for audio_file in tqdm(audio_files, desc="Evaluating"):
             try:
@@ -190,6 +200,19 @@ class SAGASREvaluator:
                 
                 results['metrics'].append(metrics)
                 results['files'].append(str(audio_file))
+
+                # 可选：提取 OpenL3 嵌入（可能较慢）
+                if enable_openl3_fd:
+                    try:
+                        pred_emb = extract_openl3_embedding(pred_hr_audio, sr=sr)
+                        tgt_emb = extract_openl3_embedding(hr_audio, sr=sr)
+                        pred_embeds.append(pred_emb)
+                        target_embeds.append(tgt_emb)
+                    except ImportError as e:
+                        print(f"[Eval] OpenL3 not available, skipping FD: {e}")
+                        enable_openl3_fd = False
+                    except Exception as e:
+                        print(f"[Eval] OpenL3 embedding failed for {audio_file}: {e}")
                 
                 # 保存生成的音频
                 if save_audio:
@@ -215,6 +238,16 @@ class SAGASREvaluator:
                 'si_sdr_std': float(np.std(si_sdr_values)) if si_sdr_values else float('nan'),
                 'mse_mean': float(np.mean(mse_values)) if mse_values else float('nan'),
             }
+
+            # 可选：OpenL3-FD
+            if enable_openl3_fd and len(pred_embeds) > 1:
+                try:
+                    pred_arr = np.stack(pred_embeds, axis=0)
+                    tgt_arr = np.stack(target_embeds, axis=0)
+                    fd_val = compute_openl3_fd(pred_arr, tgt_arr)
+                    results['summary']['openl3_fd'] = float(fd_val)
+                except Exception as e:
+                    print(f"[Eval] OpenL3-FD computation failed: {e}")
         
         # 保存结果
         results_path = os.path.join(output_dir, 'evaluation_results.json')
@@ -251,6 +284,8 @@ def main():
                        help='Number of sampling steps')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device (cuda or cpu)')
+    parser.add_argument('--enable_openl3_fd', action='store_true',
+                       help='Compute OpenL3-based Frechet Distance (may be slow)')
     
     args = parser.parse_args()
     
@@ -268,7 +303,8 @@ def main():
         num_samples=args.num_samples,
         save_audio=args.save_audio,
         target_rolloff=args.target_rolloff,
-        num_steps=args.num_steps
+        num_steps=args.num_steps,
+        enable_openl3_fd=args.enable_openl3_fd,
     )
     
     print("\n=== Evaluation Complete ===")
