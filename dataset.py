@@ -134,10 +134,13 @@ class SAGASRDataset(Dataset):
         - 滤波器阶数: 2-10 随机
         """
         # 随机选择滤波器参数
-        filter_type = random.choice(self.filter_types)
-        cutoff_freq = random.uniform(2000, 16000)  # Hz
-        order = random.randint(2, 10)
-        
+        #filter_type = random.choice(self.filter_types)
+        filter_type = 'cheby1'
+        #cutoff_freq = random.uniform(2000, 16000)  # Hz
+        cutoff_freq = 12000  # Hz
+        #order = random.randint(2, 10)
+        order = 6
+
         # 设计滤波器
         try:
             if filter_type == 'cheby1':

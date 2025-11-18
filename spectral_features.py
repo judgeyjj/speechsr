@@ -33,21 +33,21 @@ def compute_spectral_rolloff(audio, sr, rolloff_percent=0.985):
         return_complex=True
     )
     
-    # 计算功率谱
-    power = torch.abs(stft) ** 2  # [freq_bins, time_frames]
+    # 论文的是幅度谱
+    magnitude = torch.abs(stft)  # [freq_bins, time_frames]
     
     # 论文方法: 在时间轴上求和（聚合）
-    power_aggregated = power.sum(dim=1)  # [freq_bins]
+    magnitude_aggregated = magnitude.sum(dim=1)  # [freq_bins]
     
     # 计算累积和
-    cumsum = torch.cumsum(power_aggregated, dim=0)
+    cumsum = torch.cumsum(magnitude_aggregated, dim=0)
     
     # 找到滚降点
     threshold = rolloff_percent * cumsum[-1]
     rolloff_bin = torch.searchsorted(cumsum, threshold)
     
     # 转换为频率 (Hz)
-    freq_bins = torch.linspace(0, sr / 2, power_aggregated.shape[0], device=audio.device)
+    freq_bins = torch.linspace(0, sr / 2, magnitude_aggregated.shape[0], device=audio.device)
     rolloff_freq = freq_bins[rolloff_bin]  # 返回tensor，不调用.item()
     
     return rolloff_freq
