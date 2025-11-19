@@ -122,7 +122,7 @@ class SAGASRTrainer(pl.LightningModule):
         )
 
         # 论文要求：在低分辨率latent上施加10% dropout以实现CFG
-        self.latent_dropout_prob = 0.1
+        self.latent_dropout_prob = 0
 
         self._log_parameter_stats()
         
@@ -862,13 +862,13 @@ def main():
                        help='Max training steps (论文标准: 26000)')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                        help='Learning rate (论文标准: 1e-5)')
-    parser.add_argument('--use_caption', action='store_true',
+    parser.add_argument('--use_caption', action='store_true', default = False,
                        help='Use text captions (默认已开启)')
     parser.add_argument('--disable_caption', action='store_true',
                        help='Disable text captions (override default enablement)')
     parser.add_argument('--val_use_flowmatch', action='store_true',default = False,
                         help='验证阶段使用Flow Matching损失而非采样指标')
-    parser.add_argument('--disable_val_lowfreq_replace', action='store_true', default=True,
+    parser.add_argument('--disable_val_lowfreq_replace', action='store_true', default=False,
                         help='验证阶段关闭低频替换')
     parser.add_argument('--output_dir', type=str, default='outputs',
                        help='Output directory')
@@ -903,7 +903,7 @@ def main():
         audio_dir=args.train_dir,
         sample_rate=44100,
         duration=1.48,
-        compute_rolloff=True,
+        compute_rolloff=False,
         num_samples=65536,
         audio_channels=audio_channels,
     )
@@ -923,7 +923,7 @@ def main():
             audio_dir=args.val_dir,
             sample_rate=44100,
             duration=1.48,
-            compute_rolloff=True,
+            compute_rolloff=False,
             num_samples=65536,
             audio_channels=audio_channels,
         )

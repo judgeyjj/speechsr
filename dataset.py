@@ -77,7 +77,8 @@ class SAGASRDataset(Dataset):
         # 裁剪或填充到目标长度
         if hr_audio.shape[1] > self.num_samples:
             # 随机裁剪
-            start = random.randint(0, hr_audio.shape[1] - self.num_samples)
+            #start = random.randint(0, hr_audio.shape[1] - self.num_samples)
+            start = 0
             hr_audio = hr_audio[:, start:start + self.num_samples]
         elif hr_audio.shape[1] < self.num_samples:
             # 循环填充
