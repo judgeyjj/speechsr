@@ -114,12 +114,10 @@ class SAGASRTrainer(pl.LightningModule):
             dit_core.to_prepend_embed = nn.Identity()
         
         # 创建Roll-off条件器
-        # 注意：
-        # - embedding_dim_cross 必须匹配 T5 的维度（768）才能与文本 cross-attn 拼接；
-        # - 全局 roll-off 嵌入需要与 DiT 的 embed_dim 一致，以便与 timestep_embed 相加。
+        # 注意：embedding_dim_cross必须匹配T5的维度（768）才能拼接
         self.rolloff_conditioner = RolloffFourierConditioner(
-            embedding_dim_cross=768,  # 匹配 T5-base 的维度
-            embedding_dim_global=config['model']['diffusion']['config']['embed_dim'],
+            embedding_dim_cross=768,  # 匹配T5-base的维度
+            embedding_dim_global=config['model']['diffusion']['config']['global_cond_dim'],
             dropout_rate=0.1
         )
 
@@ -140,30 +138,12 @@ class SAGASRTrainer(pl.LightningModule):
 
     def _load_stable_audio_pretrained(self):
         """
-        加载 Stable Audio Open 1.0 预训练权重，并对因 input_concat_dim 变化导致的输入层做形状补丁。
-
-        注意：
-        - 仅在使用与官方 DiT 配置兼容的结构时才尝试加载（embed_dim=1536）。
-        - 对于缩小版 / 自定义结构的小模型（例如 embed_dim != 1536），为了安全起见，
-          直接跳过预训练加载，让扩展后的 DiT 从头训练，避免形状不匹配或错误的权重映射。
+        加载 Stable Audio Open 1.0 预训练权重。
+        - 对与官方 DiT 结构完全对齐的配置（embed_dim=1536, input_concat_dim=64）执行输入层补丁，
+          以适配新增的低分辨率 latent 通道；
+        - 对其它配置（例如小模型实验）仅加载形状完全匹配的权重（典型是 VAE / conditioner），
+          跳过 DiT 的特殊 patch，避免形状假设出错。
         """
-        # 根据当前配置判断是否应加载预训练权重
-        diffusion_cfg = self.config.get("model", {}).get("diffusion", {})
-        diff_type = diffusion_cfg.get("type", None)
-        diff_conf = diffusion_cfg.get("config", {})
-        embed_dim = diff_conf.get("embed_dim", None)
-
-        # 只对 DiT 且 embed_dim == 1536 的配置应用预训练 + Patch
-        if diff_type != "dit":
-            print(f"[SAGA-SR] diffusion.type={diff_type}, skip loading Stable Audio DiT pretrained weights.")
-            return
-
-        if embed_dim != 1536:
-            print(
-                f"[SAGA-SR] Detected non-standard DiT embed_dim={embed_dim}, "
-                "skip loading Stable Audio 1.0 pretrained diffusion weights."
-            )
-            return
         root_dir = os.path.dirname(os.path.abspath(__file__))
         model_dir = os.path.join(root_dir, "stable-audio-open-1.0")
 
@@ -180,65 +160,72 @@ class SAGASRTrainer(pl.LightningModule):
                 print(f"[SAGA-SR] Stable Audio checkpoint not found under: {model_dir}")
                 return
 
-            print(f"[SAGA-SR] Loading Stable Audio 1.0 DiT weights from: {ckpt_path}")
+            print(f"[SAGA-SR] Loading weights from: {ckpt_path}")
             # 加载预训练权重字典
             pretrained_state_dict = load_ckpt_state_dict(ckpt_path)
 
             # 获取当前新模型的权重字典
             current_model_dict = self.model.state_dict()
 
-            # === 关键修复：手动 Patch 维度不匹配的输入层 ===
-            # 依据 saga_model_config.json:
-            # 原模型输入 dim_in=64, 新模型输入 dim_in=128 (64 HR + 64 LR)
-            # 涉及两个层:
-            # 1. model.model.preprocess_conv (Conv1d): [Out=128, In=128, 1] vs [64, 64, 1]
-            # 2. model.model.transformer.project_in (Linear): [Out=1536, In=128] vs [1536, 64]
+            # 仅当 DiT 配置与官方大模型对齐时才执行输入层 patch
+            diff_cfg = self.config.get("model", {}).get("diffusion", {})
+            diff_type = diff_cfg.get("type")
+            diff_conf = diff_cfg.get("config", {})
+            embed_dim = diff_conf.get("embed_dim", None)
+            input_concat_dim = diff_conf.get("input_concat_dim", 0)
 
-            # 定义需要手术的层名称
-            layers_to_patch = [
-                "model.model.preprocess_conv.weight",
-                "model.model.transformer.project_in.weight",
-            ]
+            do_patch = (
+                diff_type == "dit"
+                and embed_dim == 1536
+                and input_concat_dim == 64
+            )
 
-            for key in layers_to_patch:
-                if key in pretrained_state_dict and key in current_model_dict:
-                    pretrained_weight = pretrained_state_dict[key]
-                    current_weight = current_model_dict[key]
+            if do_patch:
+                # === 关键修复：手动 Patch 维度不匹配的输入层 ===
+                # 依据官方 DiT 配置:
+                # 原模型输入 dim_in=64, 新模型输入 dim_in=128 (64 HR + 64 LR)
+                # 涉及两个层:
+                # 1. model.model.preprocess_conv (Conv1d): [Out=128, In=128, 1] vs [64, 64, 1]
+                # 2. model.model.transformer.project_in (Linear): [Out=1536, In=128] vs [1536, 64]
 
-                    # 1. 处理 Linear 层 (transformer.project_in)
-                    # PyTorch Linear 权重形状为 [Out, In]
-                    # 目标: [1536, 128], 源: [1536, 64]
-                    if key == "model.model.transformer.project_in.weight":
-                        if pretrained_weight.shape == (1536, 64) and current_weight.shape == (1536, 128):
-                            print(f"[Patching] {key}: {pretrained_weight.shape} -> {current_weight.shape}")
-                            # 复制前半部分 (HR特征)
-                            current_weight.data[:, :64] = pretrained_weight.data
-                            # 后半部分 (LR特征) 初始化为 0
-                            current_weight.data[:, 64:] = 0.0
-                            # 从待加载字典中移除，防止后续覆盖报错
-                            del pretrained_state_dict[key]
+                layers_to_patch = [
+                    "model.model.preprocess_conv.weight",
+                    "model.model.transformer.project_in.weight",
+                ]
 
-                    # 2. 处理 Conv1d 层 (preprocess_conv)
-                    # PyTorch Conv1d 权重形状为 [Out, In, Kernel]
-                    # 目标: [128, 128, 1], 源: [64, 64, 1]
-                    elif key == "model.model.preprocess_conv.weight":
-                        if pretrained_weight.shape == (64, 64, 1) and current_weight.shape == (128, 128, 1):
-                            print(f"[Patching] {key}: {pretrained_weight.shape} -> {current_weight.shape}")
-                            # 这是一个残差连接前的预处理 conv(x) + x
-                            # 我们希望初始状态下，新增的通道(LR)不产生干扰，且原有通道(HR)保持原样
+                for key in layers_to_patch:
+                    if key in pretrained_state_dict and key in current_model_dict:
+                        pretrained_weight = pretrained_state_dict[key]
+                        current_weight = current_model_dict[key]
 
-                            # 左上角 (64x64): 复制原权重 (处理 HR -> HR)
-                            current_weight.data[:64, :64, :] = pretrained_weight.data
+                        # 1. Linear 层 (transformer.project_in): [Out, In]
+                        if key == "model.model.transformer.project_in.weight":
+                            if (
+                                pretrained_weight.shape == (1536, 64)
+                                and current_weight.shape == (1536, 128)
+                            ):
+                                print(
+                                    f"[Patching] {key}: {pretrained_weight.shape} -> {current_weight.shape}"
+                                )
+                                current_weight.data[:, :64] = pretrained_weight.data
+                                current_weight.data[:, 64:] = 0.0
+                                del pretrained_state_dict[key]
 
-                            # 右下角 (64x64): 处理 LR -> LR
-                            # 初始化为 0，确保初始时刻 LR 输入不产生任何额外激活
-                            current_weight.data[64:, 64:, :].zero_()
+                        # 2. Conv1d 层 (preprocess_conv): [Out, In, K]
+                        elif key == "model.model.preprocess_conv.weight":
+                            if (
+                                pretrained_weight.shape == (64, 64, 1)
+                                and current_weight.shape == (128, 128, 1)
+                            ):
+                                print(
+                                    f"[Patching] {key}: {pretrained_weight.shape} -> {current_weight.shape}"
+                                )
+                                current_weight.data[:64, :64, :] = pretrained_weight.data
+                                current_weight.data[64:, 64:, :].zero_()
+                                current_weight.data[:64, 64:, :].zero_()
+                                current_weight.data[64:, :64, :].zero_()
 
-                            # 非对角块 (HR->LR 和 LR->HR): 设为 0 以解耦
-                            current_weight.data[:64, 64:, :].zero_()
-                            current_weight.data[64:, :64, :].zero_()
-
-                            del pretrained_state_dict[key]
+                                del pretrained_state_dict[key]
 
             # 加载剩余所有匹配的层
             copy_state_dict(self.model, pretrained_state_dict)
