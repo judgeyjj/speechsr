@@ -1,0 +1,124 @@
+{
+  "model_type": "diffusion_cond",
+  "sample_size": 65536,
+  "sample_rate": 44100,
+  "audio_channels": 2,
+
+  "model": {
+    "pretransform": {
+      "type": "autoencoder",
+      "config": {
+        "encoder": {
+          "type": "oobleck",
+          "config": {
+            "in_channels": 2,
+            "channels": 128,
+            "c_mults": [1, 2, 4, 8, 16],
+            "strides": [2, 4, 4, 8, 8],
+            "latent_dim": 128,
+            "use_snake": true
+          }
+        },
+        "decoder": {
+          "type": "oobleck",
+          "config": {
+            "out_channels": 2,
+            "channels": 128,
+            "c_mults": [1, 2, 4, 8, 16],
+            "strides": [2, 4, 4, 8, 8],
+            "latent_dim": 64,
+            "use_snake": true,
+            "final_tanh": false
+          }
+        },
+        "bottleneck": {
+          "type": "vae"
+        },
+        "latent_dim": 64,
+        "downsampling_ratio": 2048,
+        "io_channels": 2
+      }
+    },
+
+    "conditioning": {
+      "configs": [
+        {
+          "id": "prompt",
+          "type": "t5",
+          "config": {
+            "t5_model_name": "t5-base",
+            "max_length": 128
+          }
+        },
+        {
+          "id": "seconds_start",
+          "type": "number",
+          "config": {
+            "min_val": 0,
+            "max_val": 512
+          }
+        },
+        {
+          "id": "seconds_total",
+          "type": "number",
+          "config": {
+            "min_val": 0,
+            "max_val": 512
+          }
+        }
+      ],
+      "cond_dim": 768
+    },
+
+    "diffusion": {
+      "type": "dit",
+      "cross_attention_cond_ids": ["prompt", "seconds_start", "seconds_total"],
+      "global_cond_ids": ["seconds_start", "seconds_total"],
+      "config": {
+        "io_channels": 64,
+        "input_concat_dim": 64,
+
+        "embed_dim": 512,
+        "depth": 8,
+        "num_heads": 8,
+
+        "cond_token_dim": 768,
+        "global_cond_dim": 512,
+        "prepend_cond_dim": 512,
+        "project_cond_tokens": false,
+        "transformer_type": "continuous_transformer"
+      },
+      "sigma_distribution": {
+        "type": "uniform",
+        "config": {
+          "min": 0.0,
+          "max": 1.0
+        }
+      }
+    },
+    "io_channels": 64
+  },
+
+  "training": {
+    "learning_rate": 1e-4,
+    "batch_size": 4,
+    "max_steps": 26000,
+    "optimizer": {
+      "type": "AdamW",
+      "config": {
+        "betas": [0.9, 0.999],
+        "weight_decay": 0.0
+      }
+    },
+    "scheduler": {
+      "type": "InverseLR",
+      "config": {
+        "inv_gamma": 1000000,
+        "power": 0.5,
+        "warmup": 0.99
+      }
+    }
+  }
+}
+
+

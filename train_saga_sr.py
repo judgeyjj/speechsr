@@ -137,7 +137,31 @@ class SAGASRTrainer(pl.LightningModule):
             print("SwanLab logging is enabled.")
 
     def _load_stable_audio_pretrained(self):
-        """加载 Stable Audio Open 1.0 预训练权重，并对因 input_concat_dim 变化导致的输入层做形状补丁。"""
+        """
+        加载 Stable Audio Open 1.0 预训练权重，并对因 input_concat_dim 变化导致的输入层做形状补丁。
+
+        注意：
+        - 仅在使用与官方 DiT 配置兼容的结构时才尝试加载（embed_dim=1536）。
+        - 对于缩小版 / 自定义结构的小模型（例如 embed_dim != 1536），为了安全起见，
+          直接跳过预训练加载，让扩展后的 DiT 从头训练，避免形状不匹配或错误的权重映射。
+        """
+        # 根据当前配置判断是否应加载预训练权重
+        diffusion_cfg = self.config.get("model", {}).get("diffusion", {})
+        diff_type = diffusion_cfg.get("type", None)
+        diff_conf = diffusion_cfg.get("config", {})
+        embed_dim = diff_conf.get("embed_dim", None)
+
+        # 只对 DiT 且 embed_dim == 1536 的配置应用预训练 + Patch
+        if diff_type != "dit":
+            print(f"[SAGA-SR] diffusion.type={diff_type}, skip loading Stable Audio DiT pretrained weights.")
+            return
+
+        if embed_dim != 1536:
+            print(
+                f"[SAGA-SR] Detected non-standard DiT embed_dim={embed_dim}, "
+                "skip loading Stable Audio 1.0 pretrained diffusion weights."
+            )
+            return
         root_dir = os.path.dirname(os.path.abspath(__file__))
         model_dir = os.path.join(root_dir, "stable-audio-open-1.0")
 
@@ -154,7 +178,7 @@ class SAGASRTrainer(pl.LightningModule):
                 print(f"[SAGA-SR] Stable Audio checkpoint not found under: {model_dir}")
                 return
 
-            print(f"[SAGA-SR] Loading weights from: {ckpt_path}")
+            print(f"[SAGA-SR] Loading Stable Audio 1.0 DiT weights from: {ckpt_path}")
             # 加载预训练权重字典
             pretrained_state_dict = load_ckpt_state_dict(ckpt_path)
 
