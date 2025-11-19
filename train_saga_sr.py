@@ -403,10 +403,15 @@ class SAGASRTrainer(pl.LightningModule):
         # 使用Stable Audio的conditioner处理metadata
         conditioning = self.model.conditioner(metadata, self.device)
         
-        # Roll-off条件处理
-        rolloff_low = torch.stack([m['rolloff_low'] for m in metadata])
-        rolloff_high = torch.stack([m['rolloff_high'] for m in metadata])
-        rolloff_cond = self.rolloff_conditioner(rolloff_low, rolloff_high, apply_dropout=True)
+        # Roll-off条件处理（仅当数据中提供时启用）
+        if 'rolloff_low' in metadata[0] and 'rolloff_high' in metadata[0]:
+            rolloff_low = torch.stack([m['rolloff_low'] for m in metadata])
+            rolloff_high = torch.stack([m['rolloff_high'] for m in metadata])
+            rolloff_cond = self.rolloff_conditioner(rolloff_low, rolloff_high, apply_dropout=True)
+        else:
+            rolloff_low = None
+            rolloff_high = None
+            rolloff_cond = {'cross_attn': None, 'global': None}
         
         # 模型前向传播
         # 获取conditioning输入
@@ -444,14 +449,19 @@ class SAGASRTrainer(pl.LightningModule):
         loss = F.mse_loss(v_pred, v_target)
         # 记录
         self.log('train/loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=batch_size)
-        self.log('train/rolloff_low_mean', rolloff_low.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
-        self.log('train/rolloff_high_mean', rolloff_high.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
+        if rolloff_low is not None and rolloff_high is not None:
+            self.log('train/rolloff_low_mean', rolloff_low.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
+            self.log('train/rolloff_high_mean', rolloff_high.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
 
-        self._swanlab_log({
-            "train/loss": loss.item(),
-            "train/rolloff_low_mean": rolloff_low.mean().item(),
-            "train/rolloff_high_mean": rolloff_high.mean().item(),
-        })
+        log_payload = {"train/loss": loss.item()}
+        if rolloff_low is not None and rolloff_high is not None:
+            log_payload.update(
+                {
+                    "train/rolloff_low_mean": rolloff_low.mean().item(),
+                    "train/rolloff_high_mean": rolloff_high.mean().item(),
+                }
+            )
+        self._swanlab_log(log_payload)
 
         return loss
     
@@ -484,16 +494,22 @@ class SAGASRTrainer(pl.LightningModule):
         if getattr(self.hparams, "val_use_flowmatch", False):
             # 按训练同方向的 Flow Matching / Rectified Flow 目标验证
             conditioning = self.model.conditioner(metadata, self.device)
-            rolloff_low = torch.stack([m['rolloff_low'] for m in metadata])
-            rolloff_high = torch.stack([m['rolloff_high'] for m in metadata])
-            rolloff_cond = self.rolloff_conditioner(rolloff_low, rolloff_high, apply_dropout=False)
+
+            # Roll-off条件（如有）
+            if 'rolloff_low' in metadata[0] and 'rolloff_high' in metadata[0]:
+                rolloff_low = torch.stack([m['rolloff_low'] for m in metadata])
+                rolloff_high = torch.stack([m['rolloff_high'] for m in metadata])
+                rolloff_cond = self.rolloff_conditioner(rolloff_low, rolloff_high, apply_dropout=False)
+            else:
+                rolloff_low = rolloff_high = None
+                rolloff_cond = {'cross_attn': None, 'global': None}
+
             conditioning_inputs = self.model.get_conditioning_inputs(conditioning)
             if rolloff_cond['cross_attn'] is not None:
                 if conditioning_inputs.get('cross_attn_cond') is not None:
-                    conditioning_inputs['cross_attn_cond'] = torch.cat([
-                        conditioning_inputs['cross_attn_cond'],
-                        rolloff_cond['cross_attn']
-                    ], dim=1)
+                    conditioning_inputs['cross_attn_cond'] = torch.cat(
+                        [conditioning_inputs['cross_attn_cond'], rolloff_cond['cross_attn']], dim=1
+                    )
                 else:
                     conditioning_inputs['cross_attn_cond'] = rolloff_cond['cross_attn']
             if rolloff_cond['global'] is not None:
@@ -528,10 +544,14 @@ class SAGASRTrainer(pl.LightningModule):
         # 使用模型生成高分辨率音频
         conditioning = self.model.conditioner(metadata, self.device)
         
-        # Roll-off条件
-        rolloff_low = torch.stack([m['rolloff_low'] for m in metadata])
-        rolloff_high = torch.stack([m['rolloff_high'] for m in metadata])
-        rolloff_cond = self.rolloff_conditioner(rolloff_low, rolloff_high, apply_dropout=False)
+        # Roll-off条件（如有）
+        if 'rolloff_low' in metadata[0] and 'rolloff_high' in metadata[0]:
+            rolloff_low = torch.stack([m['rolloff_low'] for m in metadata])
+            rolloff_high = torch.stack([m['rolloff_high'] for m in metadata])
+            rolloff_cond = self.rolloff_conditioner(rolloff_low, rolloff_high, apply_dropout=False)
+        else:
+            rolloff_low = rolloff_high = None
+            rolloff_cond = {'cross_attn': None, 'global': None}
         
         conditioning_inputs = self.model.get_conditioning_inputs(conditioning)
         text_cross_attn = conditioning_inputs.get('cross_attn_cond')
@@ -563,8 +583,8 @@ class SAGASRTrainer(pl.LightningModule):
         # 解码为音频
         pred_audio = self.model.pretransform.decode(pred_latent)
         
-        # 低频替换（使用每个样本的低分辨率截止频率）
-        if not getattr(self.hparams, "disable_val_lowfreq_replace", False):
+        # 低频替换（使用每个样本的低分辨率截止频率，若存在）
+        if not getattr(self.hparams, "disable_val_lowfreq_replace", False) and rolloff_low is not None:
             pred_audio = self._low_frequency_replace(pred_audio, lr_audio, rolloff_low)
 
         # 仅保存当前epoch的首个样本
@@ -601,15 +621,22 @@ class SAGASRTrainer(pl.LightningModule):
         batch_size = hr_audio.shape[0]
         self.log('val/lsd', lsd, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log('val/si_sdr', si_sdr, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
-        self.log('val/rolloff_low_mean', rolloff_low.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
-        self.log('val/rolloff_high_mean', rolloff_high.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
+        if rolloff_low is not None and rolloff_high is not None:
+            self.log('val/rolloff_low_mean', rolloff_low.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
+            self.log('val/rolloff_high_mean', rolloff_high.mean(), on_step=False, on_epoch=True, batch_size=batch_size)
 
-        self._swanlab_log({
+        sw_log = {
             "val/lsd": float(lsd),
             "val/si_sdr": float(si_sdr),
-            "val/rolloff_low_mean": rolloff_low.mean().item(),
-            "val/rolloff_high_mean": rolloff_high.mean().item(),
-        })
+        }
+        if rolloff_low is not None and rolloff_high is not None:
+            sw_log.update(
+                {
+                    "val/rolloff_low_mean": rolloff_low.mean().item(),
+                    "val/rolloff_high_mean": rolloff_high.mean().item(),
+                }
+            )
+        self._swanlab_log(sw_log)
 
         return {'val_lsd': lsd, 'val_si_sdr': si_sdr}
 
