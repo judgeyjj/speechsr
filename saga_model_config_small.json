@@ -72,7 +72,7 @@
 
     "diffusion": {
       "type": "dit",
-      "cross_attention_cond_ids": ["prompt", "seconds_start", "seconds_total"],
+      "cross_attention_cond_ids": [],
       "global_cond_ids": ["seconds_start", "seconds_total"],
       "config": {
         "io_channels": 64,
