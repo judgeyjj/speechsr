@@ -632,17 +632,18 @@ class SAGASRTrainer(pl.LightningModule):
         hr_audio_mono = hr_audio
         if hr_audio_mono.shape[1] > 1:
             hr_audio_mono = hr_audio_mono.mean(dim=1, keepdim=True)
-        
-        pred_audio_flat = pred_audio.cpu().flatten()
-        hr_audio_flat = hr_audio_mono.flatten()
-        
-        # 确保长度匹配
-        min_len = min(len(pred_audio_flat), len(hr_audio_flat))
-        pred_audio_flat = pred_audio_flat[:min_len]
-        hr_audio_flat = hr_audio_flat[:min_len]
-        
-        lsd = compute_lsd(pred_audio_flat, hr_audio_flat, sr=44100)
-        si_sdr = compute_si_sdr(pred_audio_flat, hr_audio_flat)
+
+        # 仅对时间维度裁剪，保持 batch/channel 对齐
+        min_time = min(pred_audio.shape[-1], hr_audio_mono.shape[-1])
+        pred_audio_trimmed = pred_audio[..., :min_time]
+        hr_audio_trimmed = hr_audio_mono[..., :min_time]
+
+        # 将张量移至同一设备（此处统一放到 CPU 以减少显存占用）
+        pred_audio_eval = pred_audio_trimmed.detach().cpu()
+        hr_audio_eval = hr_audio_trimmed.detach().cpu()
+
+        lsd = compute_lsd(pred_audio_eval, hr_audio_eval, sr=44100)
+        si_sdr = compute_si_sdr(pred_audio_eval, hr_audio_eval)
         
         # 记录
         batch_size = hr_audio.shape[0]
