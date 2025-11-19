@@ -597,9 +597,17 @@ class SAGASRTrainer(pl.LightningModule):
         # 解码为音频
         pred_audio = self.model.pretransform.decode(pred_latent)
         
+        # 转换为单声道：如果输出是双声道，取平均
+        if pred_audio.shape[1] > 1:
+            pred_audio = pred_audio.mean(dim=1, keepdim=True)
+        
         # 低频替换（使用每个样本的低分辨率截止频率，若存在）
         if not getattr(self.hparams, "disable_val_lowfreq_replace", False) and rolloff_low is not None:
-            pred_audio = self._low_frequency_replace(pred_audio, lr_audio, rolloff_low)
+            # 确保 lr_audio 也是单声道（与 pred_audio 一致）
+            lr_audio_mono = lr_audio
+            if lr_audio_mono.shape[1] > 1:
+                lr_audio_mono = lr_audio_mono.mean(dim=1, keepdim=True)
+            pred_audio = self._low_frequency_replace(pred_audio, lr_audio_mono, rolloff_low)
 
         # 仅保存当前epoch的首个样本
         if (
@@ -620,8 +628,13 @@ class SAGASRTrainer(pl.LightningModule):
             )
         
         # 计算LSD和SI-SDR
+        # 确保 hr_audio 也是单声道（与 pred_audio 一致）
+        hr_audio_mono = hr_audio
+        if hr_audio_mono.shape[1] > 1:
+            hr_audio_mono = hr_audio_mono.mean(dim=1, keepdim=True)
+        
         pred_audio_flat = pred_audio.cpu().flatten()
-        hr_audio_flat = hr_audio.flatten()
+        hr_audio_flat = hr_audio_mono.flatten()
         
         # 确保长度匹配
         min_len = min(len(pred_audio_flat), len(hr_audio_flat))
