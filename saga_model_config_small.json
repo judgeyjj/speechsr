@@ -83,7 +83,7 @@
         "num_heads": 8,
 
         "cond_token_dim": 768,
-        "global_cond_dim": 512,
+        "global_cond_dim": 1536,
         "prepend_cond_dim": 512,
         "project_cond_tokens": false,
         "transformer_type": "continuous_transformer"

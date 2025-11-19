@@ -114,10 +114,12 @@ class SAGASRTrainer(pl.LightningModule):
             dit_core.to_prepend_embed = nn.Identity()
         
         # 创建Roll-off条件器
-        # 注意：embedding_dim_cross必须匹配T5的维度（768）才能拼接
+        # 注意：
+        # - embedding_dim_cross 必须匹配 T5 的维度（768）才能与文本 cross-attn 拼接；
+        # - 全局 roll-off 嵌入需要与 DiT 的 embed_dim 一致，以便与 timestep_embed 相加。
         self.rolloff_conditioner = RolloffFourierConditioner(
-            embedding_dim_cross=768,  # 匹配T5-base的维度
-            embedding_dim_global=config['model']['diffusion']['config']['global_cond_dim'],
+            embedding_dim_cross=768,  # 匹配 T5-base 的维度
+            embedding_dim_global=config['model']['diffusion']['config']['embed_dim'],
             dropout_rate=0.1
         )
 
