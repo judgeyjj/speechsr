@@ -72,6 +72,7 @@
     
     "diffusion": {
       "type": "dit",
+      "diffusion_objective": "rectified_flow",
       "cross_attention_cond_ids": ["prompt", "seconds_start", "seconds_total"],
       "global_cond_ids": ["seconds_start", "seconds_total"],
       "config": {
@@ -101,6 +102,9 @@
     "learning_rate": 1e-5,
     "batch_size": 4,
     "max_steps": 26000,
+    "use_ema": true,
+    "cfg_dropout_prob": 0.1,
+    "timestep_sampler": "uniform",
     "optimizer": {
       "type": "AdamW",
       "config": {

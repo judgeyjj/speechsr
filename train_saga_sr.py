@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from ema_pytorch import EMA
 
 from typing import Dict, Iterable, Optional
 
@@ -22,7 +23,7 @@ try:
 except ImportError:
     swanlab = None  # SwanLab is optional
 
-from stable_audio_tools.inference.sampling import sample_discrete_euler
+from stable_audio_tools.inference.sampling import sample_discrete_euler, get_alphas_sigmas
 from stable_audio_tools.training.utils import InverseLR
 from stable_audio_tools.models.utils import load_ckpt_state_dict, copy_state_dict
 
@@ -106,6 +107,21 @@ class SAGASRTrainer(pl.LightningModule):
         self.model = create_model_from_config(config)
         self.config = config
 
+        # EMA 设置：与 Stable Audio DiffusionCondTrainingWrapper 保持一致
+        training_cfg = self.config.get("training", {})
+        use_ema = training_cfg.get("use_ema", True)
+        if use_ema:
+            self.model_ema = EMA(
+                self.model.model,
+                beta=0.9999,
+                power=3 / 4,
+                update_every=1,
+                update_after_step=1,
+                include_online_model=False,
+            )
+        else:
+            self.model_ema = None
+
         self._load_stable_audio_pretrained()
 
         self._freeze_non_dit_modules()
@@ -117,13 +133,13 @@ class SAGASRTrainer(pl.LightningModule):
         # 注意：embedding_dim_cross必须匹配T5的维度（768）才能拼接
         # 全局 roll-off 嵌入维度与 DiT 的 embed_dim 对齐，便于与 timestep_embed 相加
         self.rolloff_conditioner = RolloffFourierConditioner(
-            embedding_dim_cross=768,  # 匹配T5-base的维度
+            embedding_dim_cross=512,  # 匹配T5-base的维度
             embedding_dim_global=config['model']['diffusion']['config']['embed_dim'],
             dropout_rate=0.1
         )
 
         # 论文要求：在低分辨率latent上施加10% dropout以实现CFG
-        self.latent_dropout_prob = 0
+        self.latent_dropout_prob = 0.1
 
         self._log_parameter_stats()
         
@@ -386,14 +402,29 @@ class SAGASRTrainer(pl.LightningModule):
         # - 路径：z_t = (1 - t) * z_data + t * z_noise
         # - 目标速度：v_target = z_noise - z_data = z_1 - z_0
         batch_size = hr_audio.shape[0]
+        diffusion_objective = getattr(self.model, "diffusion_objective", "rectified_flow")
         t = torch.rand(batch_size, device=self.device)  # [B], 均匀分布 [0,1]
+
+        # 按目标类型构造 (alpha, sigma)
+        if diffusion_objective == "v":
+            alphas, sigmas = get_alphas_sigmas(t)
+        elif diffusion_objective in ["rectified_flow", "rf_denoiser"]:
+            alphas, sigmas = 1.0 - t, t
+        else:
+            raise ValueError(f"Unsupported diffusion_objective: {diffusion_objective}")
+
+        alphas = alphas[:, None, None]
+        sigmas = sigmas[:, None, None]
         noise = torch.randn_like(hr_latent)  # [B, 64, L]
-        
-        # 插值：t=0 为数据，t=1 为噪声
-        z_t = (1 - t[:, None, None]) * hr_latent + t[:, None, None] * noise
-        
-        # 目标速度：噪声 - 数据
-        v_target = noise - hr_latent
+
+        # 组合 data 与 noise（与 Stable Audio TrainingWrapper 保持一致）
+        z_t = hr_latent * alphas + noise * sigmas
+
+        # 目标：v 或 rectified_flow
+        if diffusion_objective == "v":
+            v_target = noise * alphas - hr_latent * sigmas
+        else:
+            v_target = noise - hr_latent
         
         # 准备metadata（Stable Audio标准格式）
         # 每个metadata字典必须包含所有conditioning keys
@@ -538,11 +569,30 @@ class SAGASRTrainer(pl.LightningModule):
             conditioning_inputs['input_concat_cond'] = self._apply_latent_dropout(
                 lr_latent, training=False
             )
-            t_val = torch.rand(hr_audio.shape[0], device=self.device)
+
+            batch_size = hr_audio.shape[0]
+            diffusion_objective = getattr(self.model, "diffusion_objective", "rectified_flow")
+            t_val = torch.rand(batch_size, device=self.device)
+
+            if diffusion_objective == "v":
+                alphas_val, sigmas_val = get_alphas_sigmas(t_val)
+            elif diffusion_objective in ["rectified_flow", "rf_denoiser"]:
+                alphas_val, sigmas_val = 1.0 - t_val, t_val
+            else:
+                raise ValueError(f"Unsupported diffusion_objective: {diffusion_objective}")
+
+            alphas_val = alphas_val[:, None, None]
+            sigmas_val = sigmas_val[:, None, None]
             noise_val = torch.randn_like(hr_latent)
-            # 与训练一致：t=0 数据, t=1 噪声
-            z_t_val = (1 - t_val[:, None, None]) * hr_latent + t_val[:, None, None] * noise_val
-            v_target_val = noise_val - hr_latent
+
+            # 与训练一致：使用 (alpha, sigma) 组合数据与噪声
+            z_t_val = hr_latent * alphas_val + noise_val * sigmas_val
+
+            if diffusion_objective == "v":
+                v_target_val = noise_val * alphas_val - hr_latent * sigmas_val
+            else:
+                v_target_val = noise_val - hr_latent
+
             v_pred_val = self.model.model(z_t_val, t_val, **conditioning_inputs)
             fm_loss = F.mse_loss(v_pred_val, v_target_val)
             self.log(
@@ -707,12 +757,39 @@ class SAGASRTrainer(pl.LightningModule):
             except Exception as exc:
                 print(f"[Caption] Failed to save cache: {exc}")
 
+    def on_before_zero_grad(self, *args, **kwargs):
+        """在每个 step 反向传播之后、梯度清零之前更新 EMA。"""
+        if hasattr(self, "model_ema") and self.model_ema is not None:
+            self.model_ema.update()
+
     def on_after_backward(self):
         if self.swanlab_run is None:
             return
         grad_norm = self._compute_grad_norm()
         if grad_norm is not None:
             self._swanlab_log({"train/dit_grad_norm": grad_norm})
+
+    def export_ema_model(self, export_path: str):
+        """导出用于推理的 EMA 权重（若存在），否则导出当前 online 权重。
+
+        行为与 Stable Audio 的 DiffusionCondTrainingWrapper.export_model 对齐：
+        - 若存在 EMA，则使用 EMA 模型权重导出；
+        - 否则导出当前 online 模型权重。
+        """
+        # 备份当前 DiT 模型引用
+        original_model = self.model.model
+        try:
+            if hasattr(self, "model_ema") and self.model_ema is not None:
+                self.model.model = self.model_ema.ema_model
+                print("[SAGA-SR] Exporting EMA weights for inference.")
+            else:
+                print("[SAGA-SR] EMA disabled or not initialized, exporting online weights.")
+
+            state = {"state_dict": self.model.state_dict()}
+            torch.save(state, export_path)
+            print(f"[SAGA-SR] Exported model to: {export_path}")
+        finally:
+            self.model.model = original_model
 
     def _low_frequency_replace(
         self,
@@ -917,14 +994,16 @@ def main():
                        help='Max training steps (论文标准: 26000)')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                        help='Learning rate (论文标准: 1e-5)')
-    parser.add_argument('--use_caption', action='store_true', default = False,
+    parser.add_argument('--use_caption', action='store_true', default = True,
                        help='Use text captions (默认已开启)')
     parser.add_argument('--disable_caption', action='store_true',
                        help='Disable text captions (override default enablement)')
     parser.add_argument('--val_use_flowmatch', action='store_true',default = False,
                         help='验证阶段使用Flow Matching损失而非采样指标')
-    parser.add_argument('--disable_val_lowfreq_replace', action='store_true', default=False,
+    parser.add_argument('--disable_val_lowfreq_replace', action='store_true', default=True,
                         help='验证阶段关闭低频替换')
+    parser.add_argument('--compute_rolloff', action='store_true', default=False,
+                        help='是否在数据集里计算 rolloff_low / rolloff_high 特征')
     parser.add_argument('--output_dir', type=str, default='outputs',
                        help='Output directory')
     parser.add_argument('--val_num_steps', type=int, default=100,
@@ -958,7 +1037,7 @@ def main():
         audio_dir=args.train_dir,
         sample_rate=44100,
         duration=1.48,
-        compute_rolloff=False,
+        compute_rolloff=args.compute_rolloff,
         num_samples=65536,
         audio_channels=audio_channels,
     )
@@ -978,7 +1057,7 @@ def main():
             audio_dir=args.val_dir,
             sample_rate=44100,
             duration=1.48,
-            compute_rolloff=False,
+            compute_rolloff=args.compute_rolloff,
             num_samples=65536,
             audio_channels=audio_channels,
         )
@@ -1056,10 +1135,16 @@ def main():
         ckpt_path=args.checkpoint
     )
     
-    # 保存最终模型
+    # 保存最终 Lightning checkpoint（包含 online 权重与优化器等状态）
     final_path = os.path.join(args.output_dir, 'saga_sr_final.ckpt')
     trainer.save_checkpoint(final_path)
-    print(f"Training completed! Final model saved to: {final_path}")
+    print(f"Training completed! Final Lightning checkpoint saved to: {final_path}")
+
+    # 额外导出一份仅包含模型权重的 EMA checkpoint，用于推理
+    ema_path = os.path.join(args.output_dir, 'saga_sr_final_ema.ckpt')
+    if hasattr(model, "export_ema_model"):
+        model.export_ema_model(ema_path)
+
 
 
 if __name__ == "__main__":

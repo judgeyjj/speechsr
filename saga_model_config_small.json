@@ -67,12 +67,13 @@
           }
         }
       ],
-      "cond_dim": 768
+      "cond_dim": 512
     },
 
     "diffusion": {
       "type": "dit",
-      "cross_attention_cond_ids": [],
+      "diffusion_objective": "rectified_flow",
+      "cross_attention_cond_ids": ["prompt"],
       "global_cond_ids": ["seconds_start", "seconds_total"],
       "config": {
         "io_channels": 64,
@@ -82,8 +83,8 @@
         "depth": 8,
         "num_heads": 8,
 
-        "cond_token_dim": 768,
-        "global_cond_dim": 1536,
+        "cond_token_dim": 512,
+        "global_cond_dim": 1024,
         "prepend_cond_dim": 512,
         "project_cond_tokens": false,
         "transformer_type": "continuous_transformer"
@@ -103,6 +104,9 @@
     "learning_rate": 1e-4,
     "batch_size": 4,
     "max_steps": 26000,
+    "use_ema": true,
+    "cfg_dropout_prob": 0.1,
+    "timestep_sampler": "uniform",
     "optimizer": {
       "type": "AdamW",
       "config": {

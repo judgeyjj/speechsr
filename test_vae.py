@@ -52,7 +52,7 @@ INIT_NOISE_LEVEL = 0.5  # 推荐范围: 0.3-0.8
 if MODE == "text_only":
     # 纯文本模式
     conditioning = [{
-        "prompt": "'please call stella',a woman says",
+        "prompt": "a woman says please call mike",
         "seconds_start": 0,
         "seconds_total": 3
     }]
