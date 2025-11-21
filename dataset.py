@@ -91,7 +91,7 @@ class SAGASRDataset(Dataset):
         
         # 生成低分辨率音频（论文标准：低通滤波）
         # 注意：低通在单通道上进行，然后按需要复制通道
-        lr_audio_np = self._apply_lowpass_filter(hr_audio[0].cpu().numpy())
+        lr_audio_np, cutoff_freq = self._apply_lowpass_filter(hr_audio[0].cpu().numpy())
         lr_audio = torch.from_numpy(lr_audio_np).unsqueeze(0).float()
         if self.audio_channels > 1:
             lr_audio = lr_audio.repeat(self.audio_channels, 1)
@@ -99,7 +99,8 @@ class SAGASRDataset(Dataset):
         # 准备metadata
         metadata = {
             'lr_audio': lr_audio,
-            'audio_path': audio_path
+            'audio_path': audio_path,
+            'lr_cutoff_hz': float(cutoff_freq),
         }
         
         # 读取文本转录（若存在同名 .txt）
@@ -164,14 +165,14 @@ class SAGASRDataset(Dataset):
             # 应用滤波器（使用filtfilt保证零相位延迟）
             filtered_audio = signal.filtfilt(b, a, audio)
             
-            return filtered_audio.astype(np.float32)
+            return filtered_audio.astype(np.float32), cutoff_freq
             
         except Exception as e:
             print(f"Filter design failed ({filter_type}, order={order}, "
                   f"cutoff={cutoff_freq}): {e}")
             # 降级方案：简单低通
             b, a = signal.butter(4, cutoff_freq, btype='low', fs=self.sample_rate)
-            return signal.filtfilt(b, a, audio).astype(np.float32)
+            return signal.filtfilt(b, a, audio).astype(np.float32), cutoff_freq
 
 
 # 辅助函数：验证数据集

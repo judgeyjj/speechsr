@@ -26,8 +26,8 @@ def compute_lsd(pred_audio, target_audio, sr=44100, n_fft=2048, hop_length=512, 
     
     论文标准:
     - STFT: n_fft=2048, hop_length=512
-    - 单位: dB
-    - 越低越好（0表示完全相同）
+    - 按论文公式: LSD(S, Ŝ) = (1/T) ∑_t sqrt( (1/F) ∑_f (log10(S/Ŝ))^2 )，不再额外乘以 20
+    - 数值越低越好（0表示完全相同）
     
     Args:
         pred_audio: 预测音频 [samples] or [batch, samples]
@@ -38,7 +38,7 @@ def compute_lsd(pred_audio, target_audio, sr=44100, n_fft=2048, hop_length=512, 
         eps: 防止log(0)的小常数
     
     Returns:
-        lsd: Log-Spectral Distance (dB)
+        lsd: Log-Spectral Distance
     """
     # 确保相同shape
     if pred_audio.shape != target_audio.shape:
@@ -85,20 +85,24 @@ def compute_lsd(pred_audio, target_audio, sr=44100, n_fft=2048, hop_length=512, 
         )
 
         # 计算幅度谱
-        pred_mag = torch.abs(pred_stft) + eps
-        target_mag = torch.abs(target_stft) + eps
+        pred_mag = torch.abs(pred_stft)
+        target_mag = torch.abs(target_stft)
 
-        # 计算对数频谱
-        pred_log = torch.log10(pred_mag)
-        target_log = torch.log10(target_mag)
+        # 计算功率谱并按论文公式:
+        #   LSD(S, Ŝ) = (1/T) ∑_t sqrt( (1/F) ∑_f (log10(|S(t,f)|^2 / |Ŝ(t,f)|^2))^2 )
+        pred_power = pred_mag.pow(2)
+        target_power = target_mag.pow(2)
+        power_ratio = (pred_power + eps) / (target_power + eps)
+        log_power_ratio = torch.log10(power_ratio)
 
-        # 计算LSD: sqrt(mean((log_pred - log_target)^2))
-        diff_sq = (pred_log - target_log).pow(2)
-        lsd = torch.sqrt(diff_sq.mean(dim=(-2, -1)))  # [B]
-
-        # 转换为dB，并对batch取平均
-        lsd_db = 20.0 * lsd
-        return lsd_db.mean()
+        # 计算 LSD:
+        #   1) 频率维度上: sqrt( mean_f (log10(|S|^2/|Ŝ|^2)^2) ) → [B, T]
+        #   2) 时间维度上: 对帧平均 → [B]
+        #   3) 对 batch 平均 → 标量
+        diff_sq = log_power_ratio.pow(2)                    # [B, F, T]
+        lsd_frame = torch.sqrt(diff_sq.mean(dim=-2))        # [B, T]
+        lsd = lsd_frame.mean(dim=-1)                        # [B]
+        return lsd.mean()
 
     device_type = pred_audio.device.type
     if torch.is_autocast_enabled():

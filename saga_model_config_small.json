@@ -80,7 +80,7 @@
         "input_concat_dim": 64,
 
         "embed_dim": 512,
-        "depth": 8,
+        "depth": 16,
         "num_heads": 8,
 
         "cond_token_dim": 512,

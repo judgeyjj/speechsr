@@ -132,9 +132,11 @@ class SAGASRTrainer(pl.LightningModule):
         # 创建Roll-off条件器
         # 注意：embedding_dim_cross必须匹配T5的维度（768）才能拼接
         # 全局 roll-off 嵌入维度与 DiT 的 embed_dim 对齐，便于与 timestep_embed 相加
+        diff_cfg = config['model']['diffusion']['config']
+        cond_token_dim = diff_cfg.get('cond_token_dim', config['model']['conditioning'].get('cond_dim'))
         self.rolloff_conditioner = RolloffFourierConditioner(
-            embedding_dim_cross=512,  # 匹配T5-base的维度
-            embedding_dim_global=config['model']['diffusion']['config']['embed_dim'],
+            embedding_dim_cross=cond_token_dim,
+            embedding_dim_global=diff_cfg['embed_dim'],
             dropout_rate=0.1
         )
 
@@ -651,13 +653,23 @@ class SAGASRTrainer(pl.LightningModule):
         if pred_audio.shape[1] > 1:
             pred_audio = pred_audio.mean(dim=1, keepdim=True)
         
-        # 低频替换（使用每个样本的低分辨率截止频率，若存在）
-        if not getattr(self.hparams, "disable_val_lowfreq_replace", False) and rolloff_low is not None:
+        # 低频替换（优先使用 rolloff_low；如未计算 rolloff，则回退到数据集低通滤波的截止频率 lr_cutoff_hz）
+        cutoff_for_lfr = None
+        if rolloff_low is not None:
+            cutoff_for_lfr = rolloff_low
+        elif 'lr_cutoff_hz' in metadata[0]:
+            cutoff_for_lfr = torch.tensor(
+                [m['lr_cutoff_hz'] for m in metadata],
+                device=self.device,
+                dtype=torch.float32,
+            )
+
+        if not getattr(self.hparams, "disable_val_lowfreq_replace", False) and cutoff_for_lfr is not None:
             # 确保 lr_audio 也是单声道（与 pred_audio 一致）
             lr_audio_mono = lr_audio
             if lr_audio_mono.shape[1] > 1:
                 lr_audio_mono = lr_audio_mono.mean(dim=1, keepdim=True)
-            pred_audio = self._low_frequency_replace(pred_audio, lr_audio_mono, rolloff_low)
+            pred_audio = self._low_frequency_replace(pred_audio, lr_audio_mono, cutoff_for_lfr)
 
         # 仅保存当前epoch的首个样本
         if (
@@ -1000,7 +1012,7 @@ def main():
                        help='Disable text captions (override default enablement)')
     parser.add_argument('--val_use_flowmatch', action='store_true',default = False,
                         help='验证阶段使用Flow Matching损失而非采样指标')
-    parser.add_argument('--disable_val_lowfreq_replace', action='store_true', default=True,
+    parser.add_argument('--disable_val_lowfreq_replace', action='store_true', default=False,
                         help='验证阶段关闭低频替换')
     parser.add_argument('--compute_rolloff', action='store_true', default=False,
                         help='是否在数据集里计算 rolloff_low / rolloff_high 特征')
