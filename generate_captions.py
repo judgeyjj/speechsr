@@ -26,8 +26,8 @@ from typing import Iterable, List
 from audio_captioning_adapter import pregenerate_captions
 
 
-DEFAULT_BASE_DIR = Path("/data01/audio_group/m24_yuanjiajun/mdct_sr/data/wav48")
-DEFAULT_OUTPUT = Path("caption_cache.pt")
+DEFAULT_BASE_DIR = Path("/data01/audio_group/m24_yuanjiajun/mixed_vctk_hifitts")
+DEFAULT_OUTPUT = Path("cache.pt")
 SUBSETS = {
     "train": True,   # 训练阶段使用高分辨率音频描述
     "eval": True,     # 验证集同样使用高分辨率描述

@@ -97,6 +97,9 @@ class SAGASRTrainer(pl.LightningModule):
         # 避免频繁初始化字幕模型：仅尝试一次，失败则不再重试
         self._captioner_init_attempted: bool = False
         self._captioner_init_failed: bool = False
+        # Caption 缓存周期性保存的步数间隔（global_step 级别）
+        # 例如 1000 表示每 1000 个训练 step 触发一次保存，最终在 on_train_end 时仍会再保存一次
+        self._caption_save_interval_steps: int = 1000
         
         # 加载Stable Audio模型
         from stable_audio_tools.models.factory import create_model_from_config
@@ -509,6 +512,20 @@ class SAGASRTrainer(pl.LightningModule):
                 }
             )
         self._swanlab_log(log_payload)
+
+        # 周期性保存 caption 缓存，避免仅在 on_train_end 时保存导致中途崩溃丢失
+        if (
+            self.use_caption
+            and self.caption_cache is not None
+            and self._caption_save_interval_steps > 0
+        ):
+            # Lightning 中 global_step 从 0 开始计数，这里使用 (global_step + 1)
+            step_idx = int(self.global_step) + 1
+            if step_idx % self._caption_save_interval_steps == 0:
+                try:
+                    self.caption_cache.save()
+                except Exception as exc:
+                    print(f"[Caption] Periodic cache save failed at step {step_idx}: {exc}")
 
         return loss
     
@@ -1004,7 +1021,7 @@ def main():
                        help='DataLoader workers')
     parser.add_argument('--max_steps', type=int, default=26000,
                        help='Max training steps (论文标准: 26000)')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
+    parser.add_argument('--learning_rate', type=float, default=1e-5,
                        help='Learning rate (论文标准: 1e-5)')
     parser.add_argument('--use_caption', action='store_true', default = True,
                        help='Use text captions (默认已开启)')
@@ -1014,12 +1031,12 @@ def main():
                         help='验证阶段使用Flow Matching损失而非采样指标')
     parser.add_argument('--disable_val_lowfreq_replace', action='store_true', default=False,
                         help='验证阶段关闭低频替换')
-    parser.add_argument('--compute_rolloff', action='store_true', default=False,
+    parser.add_argument('--compute_rolloff', action='store_true', default=True,
                         help='是否在数据集里计算 rolloff_low / rolloff_high 特征')
     parser.add_argument('--output_dir', type=str, default='outputs',
                        help='Output directory')
     parser.add_argument('--val_num_steps', type=int, default=100,
-                       help='Validation sampling steps (默认与论文一致为 100，可在调试时调小以加快验证)')
+                       help='Validation sampling steps (默认与论文一致为 100，可在调试时调小以加快验证)')  #这是验证内部采样步数
     parser.add_argument(
         '--val_emulate_linear_steps',
         type=int,
@@ -1030,7 +1047,7 @@ def main():
                        help='Resume from checkpoint')
     parser.add_argument('--val_save_audio_dir', type=str, default=None,
                        help='Directory to save one validation preview audio per epoch')
-    parser.add_argument('--val_save_interval', type=int, default=1,
+    parser.add_argument('--val_save_interval', type=int, default=10,
                        help='Save validation preview every N epochs (default: 1)')
     
     args = parser.parse_args()

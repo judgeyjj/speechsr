@@ -77,8 +77,7 @@ class SAGASRDataset(Dataset):
         # 裁剪或填充到目标长度
         if hr_audio.shape[1] > self.num_samples:
             # 随机裁剪
-            #start = random.randint(0, hr_audio.shape[1] - self.num_samples)
-            start = 0
+            start = random.randint(0, hr_audio.shape[1] - self.num_samples)
             hr_audio = hr_audio[:, start:start + self.num_samples]
         elif hr_audio.shape[1] < self.num_samples:
             # 循环填充
@@ -136,12 +135,9 @@ class SAGASRDataset(Dataset):
         - 滤波器阶数: 2-10 随机
         """
         # 随机选择滤波器参数
-        #filter_type = random.choice(self.filter_types)
-        filter_type = 'cheby1'
-        #cutoff_freq = random.uniform(2000, 16000)  # Hz
-        cutoff_freq = 12000  # Hz
-        #order = random.randint(2, 10)
-        order = 6
+        filter_type = random.choice(self.filter_types)
+        cutoff_freq = random.uniform(2000, 16000)  # Hz
+        order = random.randint(2, 10)
 
         # 设计滤波器
         try:
